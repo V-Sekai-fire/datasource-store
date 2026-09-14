@@ -22,6 +22,11 @@ find_path(SQLITE_INCLUDE_DIR sqlite3.h REQUIRED)
 find_library(SQLITE_LIBRARY NAMES sqlite3 REQUIRED)
 
 add_library(weft_fdb_vfs STATIC fdb_vfs.c)
+# The SQLite loadable-extension target below links this static library
+# into a shared object, and ld refuses the R_X86_64_PC32 relocations
+# emitted for a non-PIC static without this. -fPIC has no measurable
+# cost on x86_64 for a VFS this small.
+set_property(TARGET weft_fdb_vfs PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(weft_fdb_vfs PUBLIC
   ${FDB_INCLUDE_DIR}/foundationdb ${SQLITE_INCLUDE_DIR})
 target_compile_definitions(weft_fdb_vfs PUBLIC FDB_API_VERSION=730)
