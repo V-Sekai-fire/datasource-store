@@ -70,6 +70,15 @@ add_executable(tpcc EXCLUDE_FROM_ALL tpcc.c)
 target_link_libraries(tpcc PRIVATE weft_fdb_vfs Threads::Threads m)
 add_dependencies(benchmarks bench_vfs tpcc)
 
+# The SQLite loadable-extension form of the VFS. sqlite-jdbc picks it up
+# through SELECT load_extension(...); the entities-vsk-database-roundtable
+# sqlite-fdb-vfs round loads it that way so YCSB's jdbc binding can open
+# `jdbc:sqlite:file:...?vfs=fdb_vfs` without a JNI shim of its own.
+add_library(weft_fdb_vfs_ext MODULE EXCLUDE_FROM_ALL fdb_vfs_ext.c)
+target_link_libraries(weft_fdb_vfs_ext PRIVATE weft_fdb_vfs)
+set_target_properties(weft_fdb_vfs_ext PROPERTIES PREFIX "lib")
+add_dependencies(benchmarks weft_fdb_vfs_ext)
+
 # `sqlrun` is a tool, not a test: it runs whatever SQL arrives on stdin and reports rows and
 # elapsed time. It asserts nothing, so it is out of the default build for the same reason the
 # benchmarks are -- and it is separate from them because a benchmark reports a fixed number
