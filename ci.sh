@@ -23,11 +23,11 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$here"
 
 BUILD=${BUILD:-build}
-FUZZ_BUILD=${FUZZ_BUILD:-build-fuzztest}
+KEYS_WITNESS_BUILD=${KEYS_WITNESS_BUILD:-build-keys-witness}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff integrity big-commit parallel-commit crash fuzz spec tla'
+ALL='deps build surface handoff integrity big-commit parallel-commit crash keys-witness spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -52,7 +52,7 @@ run_stage() {
 	printf '\n========== %s\n' "$name"
 	# Back to the source tree before every stage. Two stages `cd` into the run directory
 	# without a subshell, and a stage that moves the shell moves every stage after it: the
-	# first all-stages run resolved `fuzztest`, `spec/tla/derive.sh` and the Lean package
+	# first all-stages run resolved `keys-witness`, `spec/tla/derive.sh` and the Lean package
 	# against /tmp, failing three stages that were fine.
 	#
 	# It hid because the workflow splits these across four jobs, so the one arrangement that
@@ -201,13 +201,12 @@ stage_crash() {
 }
 
 # `fdb_keys.h` is pure, which is why it was split out: this needs neither FoundationDB nor
-# SQLite. Unit-test mode, a short budget for each property. Hunting for a counterexample
-# over hours is a separate run.
-stage_fuzz() {
-	CC=${CC:-clang} CXX=${CXX:-clang++} \
-		cmake -S fuzztest -B "$FUZZ_BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo
-	cmake --build "$FUZZ_BUILD" -j"${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
-	ctest --test-dir "$FUZZ_BUILD" --output-on-failure
+# SQLite. Ten properties + nine paired rule-2 planted-false controls, over witness-cpp and
+# doctest; header-only, no network fetch of a fuzzer framework, exception-free build.
+stage_keys_witness() {
+	cmake -S keys-witness -B "$KEYS_WITNESS_BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+	cmake --build "$KEYS_WITNESS_BUILD" -j"${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+	ctest --test-dir "$KEYS_WITNESS_BUILD" --output-on-failure
 }
 
 # The read-ahead window's safety argument. The only stage that checks a proof rather than a

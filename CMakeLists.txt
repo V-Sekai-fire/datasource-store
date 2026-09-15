@@ -75,15 +75,6 @@ add_executable(tpcc EXCLUDE_FROM_ALL tpcc.c)
 target_link_libraries(tpcc PRIVATE weft_fdb_vfs Threads::Threads m)
 add_dependencies(benchmarks bench_vfs tpcc)
 
-# The SQLite loadable-extension form of the VFS. sqlite-jdbc picks it up
-# through SELECT load_extension(...); the entities-vsk-database-roundtable
-# sqlite-fdb-vfs round loads it that way so YCSB's jdbc binding can open
-# `jdbc:sqlite:file:...?vfs=fdb_vfs` without a JNI shim of its own.
-add_library(weft_fdb_vfs_ext MODULE EXCLUDE_FROM_ALL fdb_vfs_ext.c)
-target_link_libraries(weft_fdb_vfs_ext PRIVATE weft_fdb_vfs)
-set_target_properties(weft_fdb_vfs_ext PROPERTIES PREFIX "lib")
-add_dependencies(benchmarks weft_fdb_vfs_ext)
-
 # `sqlrun` is a tool, not a test: it runs whatever SQL arrives on stdin and reports rows and
 # elapsed time. It asserts nothing, so it is out of the default build for the same reason the
 # benchmarks are -- and it is separate from them because a benchmark reports a fixed number
@@ -95,21 +86,10 @@ add_executable(sqlrun EXCLUDE_FROM_ALL sqlrun.c)
 target_link_libraries(sqlrun PRIVATE weft_fdb_vfs)
 add_dependencies(tools sqlrun)
 
-# The harness, as a subtree. It carries the iceoryx2 C ABI as a dlsym table, the shared
-# limits, and the payload types. Nothing here links iceoryx2: the table dlopens it, so the
-# store builds on a machine that has never seen it and fails at start rather than at link.
-#
-# The proof programs are the harness's own and belong to it, not to this build.
-set(WEFT_HARNESS_PROOF OFF CACHE BOOL "" FORCE)
-add_subdirectory(thirdparty/harness)
-
-# The store. One SQLite database for each avatar, and a thread for each core.
-add_executable(store store.cpp)
-target_link_libraries(store PRIVATE weft_fdb_vfs weft::harness)
-target_compile_options(store PRIVATE -Wall -Wextra)
-
-# The other end of the ring, which measures what the store is for. It opens no database and
-# links no VFS, because a caller is not supposed to be able to.
-add_executable(store_driver store_driver.cpp)
-target_link_libraries(store_driver PRIVATE weft::harness)
-target_compile_options(store_driver PRIVATE -Wall -Wextra)
+# Rung 11 — direct-linked YCSB workload F. Each worker opens sqlite3* against
+# the FDB VFS in-process; no daemon, no iceoryx2 message dispatch. Measured
+# 7.2× the throughput of the old iceoryx2 path (12,501 → 90,391 ops/s at
+# 8 workers × batch 1000) — the daemon was the wall.
+add_executable(ycsb_direct ycsb_direct.cpp)
+target_link_libraries(ycsb_direct PRIVATE weft_fdb_vfs Threads::Threads)
+target_compile_options(ycsb_direct PRIVATE -Wall -Wextra)

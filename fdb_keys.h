@@ -9,7 +9,7 @@
 // the oldest pin by reading the edge of a range, `load_newest_shard` trusts that order,
 // and `drop_unfinished_commit` clears a range that starts at a number. If the encoding
 // ever stopped being order preserving, each of those would read the wrong row and none of
-// them would fail loudly. `fuzz/keys_test.cc` holds that property and the ones below.
+// them would fail loudly. `keys-witness/keys_test.cc` holds that property and the ones below.
 //
 // SPDX-License-Identifier: Apache-2.0
 #ifndef WEFT_FDB_KEYS_H
