@@ -75,7 +75,11 @@ sqlite3 *open_db(const std::string &filename, const char *vfs) {
     }
     sqlite3_exec(db, "PRAGMA journal_mode=MEMORY", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE", nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "PRAGMA cache_size=-262144", nullptr, nullptr, nullptr);
+    const char *cache_env = std::getenv("WEFT_YCSB_CACHE_KIB");
+    const long cache_kib = cache_env ? std::atol(cache_env) : 262144;
+    char pragma[64];
+    std::snprintf(pragma, sizeof pragma, "PRAGMA cache_size=-%ld", cache_kib);
+    sqlite3_exec(db, pragma, nullptr, nullptr, nullptr);
     return db;
 }
 
