@@ -1,0 +1,5 @@
+# CMake produces its output here when the encoding-only property tests
+# are built standalone (via `cmake -S btree-fdb -B btree-fdb/build ...`).
+# The main tree's build sits elsewhere; this is only for the encode_test
+# binary and its FetchContent copies of doctest and witness-cpp.
+build/

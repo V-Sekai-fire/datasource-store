@@ -18,8 +18,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Threads REQUIRED)
 find_path(FDB_INCLUDE_DIR foundationdb/fdb_c.h REQUIRED)
 find_library(FDB_LIBRARY NAMES fdb_c REQUIRED)
-find_path(SQLITE_INCLUDE_DIR sqlite3.h REQUIRED)
-find_library(SQLITE_LIBRARY NAMES sqlite3 REQUIRED)
+
+# SQLite is vendored (Rung 10 Slice 1). `thirdparty/sqlite/` defines the
+# `weft_sqlite3` static target; every downstream binary links it in place
+# of the system `libsqlite3`. Slice 2 cuts `btree.c` out of the amalgamation
+# and links `btree-fdb/btree_fdb.c` in its place; keeping the SQLite target
+# separate here is what makes that swap a one-file edit.
+add_subdirectory(thirdparty/sqlite)
 
 add_library(weft_fdb_vfs STATIC fdb_vfs.c)
 # The SQLite loadable-extension target below links this static library
@@ -28,9 +33,9 @@ add_library(weft_fdb_vfs STATIC fdb_vfs.c)
 # cost on x86_64 for a VFS this small.
 set_property(TARGET weft_fdb_vfs PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(weft_fdb_vfs PUBLIC
-  ${FDB_INCLUDE_DIR}/foundationdb ${SQLITE_INCLUDE_DIR})
+  ${FDB_INCLUDE_DIR}/foundationdb)
 target_compile_definitions(weft_fdb_vfs PUBLIC FDB_API_VERSION=730)
-target_link_libraries(weft_fdb_vfs PUBLIC ${FDB_LIBRARY} ${SQLITE_LIBRARY} Threads::Threads)
+target_link_libraries(weft_fdb_vfs PUBLIC ${FDB_LIBRARY} weft_sqlite3 Threads::Threads)
 
 # The programs that assert something in-process. These are the default build: each opens a
 # database, checks a property and exits, so a plain `cmake --build` produces exactly the set
@@ -75,15 +80,6 @@ add_executable(tpcc EXCLUDE_FROM_ALL tpcc.c)
 target_link_libraries(tpcc PRIVATE weft_fdb_vfs Threads::Threads m)
 add_dependencies(benchmarks bench_vfs tpcc)
 
-# The SQLite loadable-extension form of the VFS. sqlite-jdbc picks it up
-# through SELECT load_extension(...); the entities-vsk-database-roundtable
-# sqlite-fdb-vfs round loads it that way so YCSB's jdbc binding can open
-# `jdbc:sqlite:file:...?vfs=fdb_vfs` without a JNI shim of its own.
-add_library(weft_fdb_vfs_ext MODULE EXCLUDE_FROM_ALL fdb_vfs_ext.c)
-target_link_libraries(weft_fdb_vfs_ext PRIVATE weft_fdb_vfs)
-set_target_properties(weft_fdb_vfs_ext PROPERTIES PREFIX "lib")
-add_dependencies(benchmarks weft_fdb_vfs_ext)
-
 # `sqlrun` is a tool, not a test: it runs whatever SQL arrives on stdin and reports rows and
 # elapsed time. It asserts nothing, so it is out of the default build for the same reason the
 # benchmarks are -- and it is separate from them because a benchmark reports a fixed number
@@ -95,21 +91,10 @@ add_executable(sqlrun EXCLUDE_FROM_ALL sqlrun.c)
 target_link_libraries(sqlrun PRIVATE weft_fdb_vfs)
 add_dependencies(tools sqlrun)
 
-# The harness, as a subtree. It carries the iceoryx2 C ABI as a dlsym table, the shared
-# limits, and the payload types. Nothing here links iceoryx2: the table dlopens it, so the
-# store builds on a machine that has never seen it and fails at start rather than at link.
-#
-# The proof programs are the harness's own and belong to it, not to this build.
-set(WEFT_HARNESS_PROOF OFF CACHE BOOL "" FORCE)
-add_subdirectory(thirdparty/harness)
-
-# The store. One SQLite database for each avatar, and a thread for each core.
-add_executable(store store.cpp)
-target_link_libraries(store PRIVATE weft_fdb_vfs weft::harness)
-target_compile_options(store PRIVATE -Wall -Wextra)
-
-# The other end of the ring, which measures what the store is for. It opens no database and
-# links no VFS, because a caller is not supposed to be able to.
-add_executable(store_driver store_driver.cpp)
-target_link_libraries(store_driver PRIVATE weft::harness)
-target_compile_options(store_driver PRIVATE -Wall -Wextra)
+# Rung 11 — direct-linked YCSB workload F. Each worker opens sqlite3* against
+# the FDB VFS in-process; no daemon, no iceoryx2 message dispatch. Measured
+# 5.2× the throughput of the old iceoryx2 path (12,501 → 65,020 ops/s at
+# 4 workers × batch 1000) — the daemon was the wall.
+add_executable(ycsb_direct ycsb_direct.cpp)
+target_link_libraries(ycsb_direct PRIVATE weft_fdb_vfs Threads::Threads)
+target_compile_options(ycsb_direct PRIVATE -Wall -Wextra)

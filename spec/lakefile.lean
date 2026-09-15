@@ -6,4 +6,4 @@ package «weft-store-spec» where
   -- nobody checks.
 
 @[default_target] lean_lib «Spec» where
-  roots := #[`ReadAhead, `ParallelCommit, `Backend, `PipelinedRead, `GroupCommit, `PrewriteCoalesce, `ShardBatchCommit]
+  roots := #[`ReadAhead, `ParallelCommit, `Backend, `PipelinedRead, `GroupCommit, `PrewriteCoalesce, `ShardBatchCommit, `BtreeReplacement]
