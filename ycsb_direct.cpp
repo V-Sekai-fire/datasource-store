@@ -75,7 +75,7 @@ sqlite3 *open_db(const std::string &filename, const char *vfs) {
     }
     sqlite3_exec(db, "PRAGMA journal_mode=MEMORY", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE", nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "PRAGMA cache_size=-262144", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA cache_size=-4194304", nullptr, nullptr, nullptr);
     return db;
 }
 
