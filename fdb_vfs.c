@@ -95,6 +95,19 @@
 // limit below comes from them, so there is no constant to tune. See `Store.lean`.
 #define FDB_TXN_LIMIT 10000000
 
+// Soft cap on buffered dirty pages inside a single SQLite transaction. Once
+// this cap is hit, `buffer_page` returns SQLITE_FULL and SQLite aborts the
+// statement rather than growing the buffer unboundedly. See the `bp_bounded`
+// theorem in spec/CacheBackpressure.lean.
+//
+// The cap is expressed as four STAGE_TXN_PAGES chunks. STAGE_TXN_PAGES is
+// how many pages a single FDB transaction can stage (FDB_TXN_LIMIT /
+// DELTA_ROW), i.e. one drain-function chunk. Four of them is four FDB
+// round-trips of headroom before the producer must yield. Tying the cap
+// to the drain's chunk size aligns the Lean model's `cap` with what the
+// staging path actually serves per commit.
+#define DIRTY_SOFT_CAP (STAGE_TXN_PAGES * 4)
+
 // How much of a transaction one page costs, counting the key and not only the bytes. A
 // limit that counts the pages alone overruns the transaction on the keys.
 #define DELTA_ROW (PAGE + KEYMAX)
@@ -929,6 +942,14 @@ static DirtyPage *buffer_page(FdbFile *file, uint32_t pgno, int whole, int *rc) 
 	*rc = SQLITE_OK;
 
 	if (find_dirty(file, pgno, &slot)) return file->dirty[slot];
+
+	if (file->ndirty >= DIRTY_SOFT_CAP) {
+		// The dirty buffer is at the soft cap. Return SQLITE_FULL so SQLite
+		// aborts the statement rather than growing the queue past what the
+		// drain function can serve. See spec/CacheBackpressure.lean bp_bounded.
+		*rc = SQLITE_FULL;
+		return NULL;
+	}
 
 	if ((int64_t)(file->ndirty + 1) * file->pidx_row > FDB_TXN_LIMIT - HEAD_TXN_RESERVE) {
 		// The index rows of this commit no longer fit one transaction, so the commit
