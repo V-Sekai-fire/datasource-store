@@ -17,7 +17,7 @@
 //     hand and has a race. The layout below moves that work into one place with one
 //     owner, and `Store.lean` proves the rule the fold must obey.
 //
-// Layout. rivet's Depot layout, modelled in docs/spec/Store.lean:
+// Layout. The actor-supervisor Depot layout, modelled in docs/spec/Store.lean:
 //
 //   weft/db/<name>/HEAD                 the txid of the newest commit
 //   weft/db/<name>/SIZE                 the file size, 8 bytes big endian
@@ -209,7 +209,7 @@ static fdb_error_t await(FDBFuture *f) {
 // ── Keys ──────────────────────────────────────────────────────────────────────
 //
 // In `fdb_keys.h`, because they depend on neither FoundationDB nor SQLite and
-// `fuzz/keys_test.cc` tests them without either. A number goes into a key big endian, so
+// `keys-witness/keys_test.cc` tests them without either. A number goes into a key big endian, so
 // the order of the keys is the order of the numbers, and a range read then gives pages
 // and commits in order.
 
@@ -662,9 +662,16 @@ static void ra_reset(FdbFile *f) { f->ra_count = 0; }
 
 // Read one page from the store. `present` stays 0 when no commit and no shard holds it,
 // and the caller then zero-fills.
+//
+// The read pipelines PIDX and DELTA(HEAD): both futures are issued at once, so the network
+// carries them together. When PIDX names HEAD, the speculative DELTA future already holds
+// the answer and one round trip is saved. When PIDX names a different txid or is empty,
+// the speculative future is discarded and the ordinary second read is issued. Both keys
+// go through the transaction unqualified, so both land in the FDB read-conflict set --
+// `spec/PipelinedRead.sequential_read_set_subset_pipelined` is what carries that.
 static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno,
                                    uint8_t *out, int *len, int *present) {
-	uint8_t key[KEYMAX];
+	uint8_t pidx_key[KEYMAX], data_key[KEYMAX];
 	uint64_t owner = 0;
 	int got = 0;
 
@@ -680,17 +687,64 @@ static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno
 		if (ra_hit(f, pgno, out, len, present)) return 0;
 	}
 
-	int klen = key_pidx(key, f->name, pgno);
-	fdb_error_t err = get_u64(tr, key, klen, &owner, &got);
-	if (err) return err;
+	const int pidx_klen = key_pidx(pidx_key, f->name, pgno);
+	FDBFuture *pidx_f = fdb_transaction_get(tr, pidx_key, pidx_klen, 0);
+
+	// A fresh database has no commits, so there is no HEAD to speculate against. Skip the
+	// speculative future in that case; the sequential path is exactly right.
+	FDBFuture *spec_f = NULL;
+	if (f->head) {
+		int spec_klen = key_delta(data_key, f->name, f->head, pgno);
+		spec_f = fdb_transaction_get(tr, data_key, spec_klen, 0);
+	}
+
+	fdb_error_t err = await(pidx_f);
+	if (!err) {
+		fdb_bool_t have;
+		const uint8_t *val;
+		int vlen;
+		err = fdb_future_get_value(pidx_f, &have, &val, &vlen);
+		if (!err && have && vlen == 8) {
+			owner = get_be64(val);
+			got = 1;
+		}
+	}
+	fdb_future_destroy(pidx_f);
+	if (err) {
+		if (spec_f) fdb_future_destroy(spec_f);
+		return err;
+	}
+
+	if (got && spec_f && owner == f->head) {
+		// The speculation hit: the answer is already coming back.
+		err = await(spec_f);
+		if (!err) {
+			fdb_bool_t have;
+			const uint8_t *val;
+			int vlen;
+			err = fdb_future_get_value(spec_f, &have, &val, &vlen);
+			if (!err) {
+				*present = have;
+				if (have) {
+					int n = vlen > PAGE ? PAGE : vlen;
+					memcpy(out, val, (size_t)n);
+					if (len) *len = n;
+				}
+			}
+		}
+		fdb_future_destroy(spec_f);
+		return err;
+	}
+
+	if (spec_f) fdb_future_destroy(spec_f);
 
 	if (got) {
-		klen = key_delta(key, f->name, owner, pgno);
-		return get_bytes(tr, key, klen, out, PAGE, len, present);
+		int klen = key_delta(data_key, f->name, owner, pgno);
+		return get_bytes(tr, data_key, klen, out, PAGE, len, present);
 	}
 	if (f->has_shard) {
-		klen = key_shard(key, f->name, f->shard_as_of, pgno);
-		return get_bytes(tr, key, klen, out, PAGE, len, present);
+		int klen = key_shard(data_key, f->name, f->shard_as_of, pgno);
+		return get_bytes(tr, data_key, klen, out, PAGE, len, present);
 	}
 	return 0;
 }
@@ -884,14 +938,24 @@ static DirtyPage *buffer_page(FdbFile *file, uint32_t pgno, int whole, int *rc) 
 	}
 
 	// Read the stored page before the buffer holds it, so the read goes to the store.
+	//
+	// Rung 4: the read-ahead window may already hold this page from an earlier read
+	// transaction. Under EXCLUSIVE mode + fence, nothing else has changed the store since,
+	// and `ra_reset` fires on every event that could — a commit, a fold, a truncate — so
+	// a window hit is the same bytes a fresh read would produce. `spec/PrewriteCoalesce.lean`
+	// is `coalesced_prewrite_read_agrees`. Saves one whole FDB transaction per partial
+	// write, which under YCSB workload F is every RMW.
 	uint8_t stored[PAGE];
 	memset(stored, 0, PAGE);
 	if (!whole) {
-		struct read_ctx r = {file, stored, PAGE, (sqlite3_int64)pgno * PAGE, 0};
-		int err = run_txn(read_body, &r, 0, SQLITE_IOERR_READ);
-		if (err != SQLITE_OK && err != SQLITE_IOERR_SHORT_READ) {
-			*rc = err;
-			return NULL;
+		int hit_len = 0, hit_present = 0;
+		if (!ra_hit(file, pgno, stored, &hit_len, &hit_present)) {
+			struct read_ctx r = {file, stored, PAGE, (sqlite3_int64)pgno * PAGE, 0};
+			int err = run_txn(read_body, &r, 0, SQLITE_IOERR_READ);
+			if (err != SQLITE_OK && err != SQLITE_IOERR_SHORT_READ) {
+				*rc = err;
+				return NULL;
+			}
 		}
 	}
 
@@ -945,8 +1009,9 @@ struct flush_ctx {
 //
 // The single-writer invariant is not absolute, which is why this cannot be assumed away.
 // `Weft.Actors` says Horde is CRDT-based and chooses availability, so during a partition
-// each side may briefly run its own instance. rivet reaches the same answer, in
-// `depot_client_types::is_head_fence_mismatch`.
+// each side may briefly run its own instance. The actor supervisor reaches the same
+// answer in its depot client, whose `is_head_fence_mismatch` predicate is the fence
+// this file writes.
 //
 // Every write transaction reads the fence, not only the commit. The first version checked
 // it in the commit alone, so a stale writer could still compact. Compaction drops the

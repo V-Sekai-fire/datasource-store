@@ -45,7 +45,7 @@ namespace Weft.Backend
 
 A key is bytes, and the order is the order of the bytes. `fdb_keys.h` puts every number in
 a key big endian precisely so that this order is the order of the numbers, and
-`fuzz/keys_test.cc` holds that property. So the ordering below is the one assumption this
+`keys-witness/keys_test.cc` holds that property. So the ordering below is the one assumption this
 file makes about keys, and it is checked elsewhere rather than here. -/
 
 abbrev Key := List UInt8
