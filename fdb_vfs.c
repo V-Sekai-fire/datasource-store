@@ -85,6 +85,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 // SQLite's page size. This is not a choice.
@@ -397,7 +398,66 @@ typedef struct {
 	// `key_pidx` builds for it, plus the eight-byte value. Fixed for the life of the file,
 	// since the name does not change and a page number is always four bytes.
 	int pidx_row;
+
+	// Cached read transaction, reused across xRead calls to spread one GRV over
+	// many page reads. FDB caps a transaction's lifetime at five seconds; we
+	// hold ours for four so the deadline never surprises us mid-read. Every
+	// `flush` (a successful FDB commit) invalidates it, so a reader never sees
+	// bytes older than this connection's own last write.
+	FDBTransaction *ro_tr;
+	uint64_t ro_tr_deadline_us;
 } FdbFile;
+
+// A read that reuses a cached FDB transaction across xRead calls on the same
+// file. One SQLite BEGIN..COMMIT can issue thousands of page reads; the store's
+// pre-change shape spent a fresh GRV round-trip on each. The cache holds one
+// FDBTransaction on the FdbFile, refreshing when either FDB's five-second
+// transaction lifetime is about to expire or a commit has moved the head. A
+// retryable error drops the cached tr and falls through to a fresh transaction,
+// same as `run_txn`.
+static int run_read_txn(txn_body body, void *ctx, FdbFile *f) {
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	const uint64_t now = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+
+	if (f->ro_tr && now < f->ro_tr_deadline_us) {
+		int final = 0;
+		fdb_error_t err = body(f->ro_tr, ctx, &final);
+		if (final) return final;
+		if (!err) return SQLITE_OK;
+		fdb_transaction_destroy(f->ro_tr);
+		f->ro_tr = NULL;
+	}
+
+	FDBTransaction *tr = NULL;
+	if (fdb_database_create_transaction(g_db, &tr)) return SQLITE_IOERR_READ;
+
+	for (;;) {
+		int final = 0;
+		fdb_error_t err = body(tr, ctx, &final);
+		if (final) {
+			fdb_transaction_destroy(tr);
+			return final;
+		}
+		if (!err) {
+			if (f->ro_tr) fdb_transaction_destroy(f->ro_tr);
+			f->ro_tr = tr;
+			// FDB caps a transaction at five seconds; we hold ours for four
+			// so a slow read never trips the cap mid-flight.
+			f->ro_tr_deadline_us = now + 4000000ULL;
+			return SQLITE_OK;
+		}
+
+		FDBFuture *r = fdb_transaction_on_error(tr, err);
+		fdb_error_t fatal = await(r);
+		fdb_future_destroy(r);
+		if (fatal) {
+			fdb_transaction_destroy(tr);
+			return SQLITE_IOERR_READ;
+		}
+	}
+}
+
 
 // Find the slot of `pgno`, or where it would go. Returns 1 when it is there.
 static int find_dirty(FdbFile *f, uint32_t pgno, int *slot) {
@@ -905,8 +965,9 @@ static fdb_error_t read_body(FDBTransaction *tr, void *ctx, int *final) {
 }
 
 static int fdb_read(sqlite3_file *file, void *buf, int amt, sqlite3_int64 off) {
-	struct read_ctx r = {(FdbFile *)file, buf, amt, off, 0};
-	int rc = run_txn(read_body, &r, 0, SQLITE_IOERR_READ);
+	FdbFile *f = (FdbFile *)file;
+	struct read_ctx r = {f, buf, amt, off, 0};
+	int rc = run_read_txn(read_body, &r, f);
 	if (rc != SQLITE_OK) return rc;
 	// SQLite needs the short-read code so it can zero-fill and grow the file.
 	return r.short_read ? SQLITE_IOERR_SHORT_READ : SQLITE_OK;
@@ -1155,6 +1216,10 @@ static int flush(FdbFile *f) {
 	f->log_pages += (uint64_t)f->ndirty;
 	clear_dirty(f);
 	ra_reset(f); // those pages are not what the window holds any more
+	if (f->ro_tr) {
+		fdb_transaction_destroy(f->ro_tr);
+		f->ro_tr = NULL;
+	}
 
 	// Note that a fold is owed; do not do it here. Folding on the commit that happens to
 	// trip the ratio charges one writer for work every writer caused, and the bill grows
@@ -1567,6 +1632,10 @@ static int txn_resolve_part(FdbFile *f, uint64_t staged) {
 	f->log_pages += (uint64_t)f->ndirty;
 	clear_dirty(f);
 	ra_reset(f);
+	if (f->ro_tr) {
+		fdb_transaction_destroy(f->ro_tr);
+		f->ro_tr = NULL;
+	}
 	return SQLITE_OK;
 }
 
@@ -1976,6 +2045,10 @@ static int fdb_close(sqlite3_file *file) {
 	free(f->dirty);
 	f->dirty = NULL;
 	f->capdirty = 0;
+	if (f->ro_tr) {
+		fdb_transaction_destroy(f->ro_tr);
+		f->ro_tr = NULL;
+	}
 	free(f->ra_window);
 	free(f->ra_state);
 	f->ra_window = NULL;
