@@ -84,6 +84,11 @@ add_dependencies(benchmarks bench_vfs tpcc)
 add_custom_target(tools)
 add_executable(sqlrun EXCLUDE_FROM_ALL sqlrun.c)
 target_link_libraries(sqlrun PRIVATE weft_fdb_vfs)
+
+# The store helper consumers drive over a line protocol. Built here so the
+# programs that link the VFS and the programs that speak to it share one source.
+add_executable(weft_sql EXCLUDE_FROM_ALL weft_sql.c)
+target_link_libraries(weft_sql PRIVATE weft_fdb_vfs)
 add_dependencies(tools sqlrun)
 
 # Rung 11 — direct-linked YCSB workload F. Each worker opens sqlite3* against
