@@ -195,37 +195,65 @@ structure Store where
   shard : Nat
   owner : Nat
 
-/-- One writer handle: the id it opened under and the view it cached. -/
+/-- One writer handle: the id it opened under and the view it cached. `pending` is a group
+commit it has staged and not yet settled: the pages are in the store under `head + 1`, no
+read can reach them, and the handle still holds them in its dirty buffer. -/
 structure Handle where
   id : Nat
   fence : Nat
   head : Nat
   shard : Nat
+  pending : Bool
 
 structure State where
   store : Store
   a : Handle
 
-/-- What other processes, and this one, do to the store. -/
+/-- What other processes, and this one, do to the store.
+
+`openRW` carries recovery with it, because that is the only caller of `weft_txn_recover`:
+an opener first finishes any group whose intents are all present, moving that file's head
+to the staged txid without touching its fence (`resolve_body`), and then raises the fence
+(`open_body`). The window in which the owner's head is behind the store's is therefore
+always closed by the fence moving, and inside it the owner's dirty buffer still holds every
+page the resolution re-pointed, so its reads are the staged state either way. -/
 inductive Event where
-  /-- `vfs_open` read-write: `raise_fence`, and the opener loads the head and shard. -/
+  /-- `vfs_open` read-write: recovery, then `raise_fence`, and the opener loads the view. -/
   | openRW (h : Nat)
   /-- `flush`: refused by `check_fence` unless `h` owns the fence; else the head moves. -/
   | commit (h : Nat)
   /-- `compact`: refused the same way; else the shard version becomes the head. -/
   | fold (h : Nat)
+  /-- `txn_stage_here`: the owner's pages go under `head + 1`, unreachable, and stay in its
+  dirty buffer. The store a read sees does not change. -/
+  | stage (h : Nat)
+  /-- `txn_resolve_part` by the owner: the head moves to the staged txid, by `head_body`
+  under `check_fence`, and the buffer is cleared. -/
+  | settle (h : Nat)
+
+/-- What `weft_txn_recover` does to the store before an open raises the fence: a group the
+owner staged and did not settle is finished, by moving the head to the staged txid. -/
+def recover (s : State) : Store :=
+  if s.a.pending ∧ s.store.owner = s.a.id ∧ s.store.head = s.a.head then
+    { s.store with head := s.a.head + 1 }
+  else s.store
+
+theorem recover_fence (s : State) : (recover s).fence = s.store.fence := by
+  unfold recover; split <;> rfl
 
 def step (s : State) : Event → State
   | .openRW h =>
-    let st := { s.store with fence := s.store.fence + 1, owner := h }
+    let st := { recover s with fence := (recover s).fence + 1, owner := h }
     if h = s.a.id then
-      { store := st, a := { s.a with fence := st.fence, head := st.head, shard := st.shard } }
+      { store := st,
+        a := { s.a with fence := st.fence, head := st.head, shard := st.shard, pending := false } }
     else
       { s with store := st }
   | .commit h =>
     if s.store.owner = h then
       let st := { s.store with head := s.store.head + 1 }
-      if h = s.a.id then { store := st, a := { s.a with head := st.head } }
+      if h = s.a.id then
+        if s.a.pending then s else { store := st, a := { s.a with head := st.head } }
       else { s with store := st }
     else s
   | .fold h =>
@@ -233,6 +261,13 @@ def step (s : State) : Event → State
       let st := { s.store with shard := s.store.head }
       if h = s.a.id then { store := st, a := { s.a with shard := st.shard } }
       else { s with store := st }
+    else s
+  | .stage h =>
+    if s.store.owner = h ∧ h = s.a.id then { s with a := { s.a with pending := true } } else s
+  | .settle h =>
+    if s.store.owner = h ∧ h = s.a.id ∧ s.a.pending then
+      { store := { s.store with head := s.a.head + 1 },
+        a := { s.a with head := s.a.head + 1, pending := false } }
     else s
 
 def run : List Event → State → State
@@ -254,16 +289,21 @@ theorem step_inv (s : State) (e : Event) (h : Inv s) : Inv (step s e) := by
     simp only [step]
     split
     · exact ⟨Nat.le_refl _, fun _ => ⟨by simp_all, rfl, rfl⟩⟩
-    · refine ⟨Nat.le_succ_of_le hle, fun hf => ?_⟩
-      simp at hf
-      omega
+    · refine ⟨?_, fun hf => ?_⟩
+      · show s.a.fence ≤ (recover s).fence + 1
+        rw [recover_fence]; omega
+      · exfalso
+        have hf' : (recover s).fence + 1 = s.a.fence := hf
+        rw [recover_fence] at hf'; omega
   | commit k =>
     simp only [step]
     split
     · split
-      · refine ⟨hle, fun hf => ?_⟩
-        have := hcoh hf
-        simp_all
+      · split
+        · exact ⟨hle, hcoh⟩
+        · refine ⟨hle, fun hf => ?_⟩
+          have := hcoh hf
+          simp_all
       · refine ⟨hle, fun hf => ?_⟩
         have := hcoh hf
         simp_all
@@ -279,6 +319,18 @@ theorem step_inv (s : State) (e : Event) (h : Inv s) : Inv (step s e) := by
         have := hcoh hf
         simp_all
     · exact ⟨hle, hcoh⟩
+  | stage k =>
+    simp only [step]
+    split
+    · exact ⟨hle, fun hf => hcoh hf⟩
+    · exact ⟨hle, hcoh⟩
+  | settle k =>
+    simp only [step]
+    split
+    · refine ⟨hle, fun hf => ?_⟩
+      have := hcoh hf
+      exact ⟨this.1, rfl, this.2.2⟩
+    · exact ⟨hle, hcoh⟩
 
 theorem run_inv (evs : List Event) (s : State) (h : Inv s) : Inv (run evs s) := by
   induction evs generalizing s with
@@ -288,7 +340,8 @@ theorem run_inv (evs : List Event) (s : State) (h : Inv s) : Inv (run evs s) := 
 /-- A handle that just opened read-write holds the fence it raised, and its view is the
 store's. -/
 def opened (st : Store) (id : Nat) : State :=
-  step { store := st, a := { id := id, fence := 0, head := 0, shard := 0 } } (.openRW id)
+  step { store := st, a := { id := id, fence := 0, head := 0, shard := 0, pending := false } }
+    (.openRW id)
 
 theorem opened_inv (st : Store) (id : Nat) : Inv (opened st id) := by
   unfold opened
@@ -313,5 +366,39 @@ theorem reader_coherent (store : Store) (head shard : Nat)
     (h : readerCheck store head shard = true) : store.head = head ∧ store.shard = shard := by
   simp [readerCheck] at h
   exact h
+
+/-! ## The rule, both ways
+
+A SQLite transaction may run on several FoundationDB read versions: the cached transaction
+is replaced at the four-second mark, and a large commit stages. The rule is that every read
+version it is served from is the same store state, or the read is refused. -/
+
+/-- Two reads a reader's check let through, against one view, saw the same head and shard. -/
+theorem served_reads_agree (s₁ s₂ : Store) (head shard : Nat)
+    (h₁ : readerCheck s₁ head shard = true) (h₂ : readerCheck s₂ head shard = true) :
+    s₁.head = s₂.head ∧ s₁.shard = s₂.shard := by
+  have a := reader_coherent s₁ head shard h₁
+  have b := reader_coherent s₂ head shard h₂
+  exact ⟨a.1.trans b.1.symm, a.2.trans b.2.symm⟩
+
+/-- The contrapositive: a store that is not the view's is refused. -/
+theorem refused_unless_same (s : Store) (head shard : Nat)
+    (h : ¬ (s.head = head ∧ s.shard = shard)) : readerCheck s head shard = false := by
+  cases hc : readerCheck s head shard
+  · rfl
+  · exact absurd (reader_coherent s head shard hc) h
+
+/-- The writer's side of the same rule, through `coherent`: two reads whose fence check passed
+on the same handle saw the same head and shard, because each saw the handle's. -/
+theorem writer_reads_agree (st : Store) (id : Nat) (evs₁ evs₂ : List Event)
+    (h₁ : (run evs₁ (opened st id)).store.fence = (run evs₁ (opened st id)).a.fence)
+    (h₂ : (run evs₂ (opened st id)).store.fence = (run evs₂ (opened st id)).a.fence)
+    (same : (run evs₁ (opened st id)).a.head = (run evs₂ (opened st id)).a.head ∧
+      (run evs₁ (opened st id)).a.shard = (run evs₂ (opened st id)).a.shard) :
+    (run evs₁ (opened st id)).store.head = (run evs₂ (opened st id)).store.head ∧
+      (run evs₁ (opened st id)).store.shard = (run evs₂ (opened st id)).store.shard := by
+  have a := coherent st id evs₁ h₁
+  have b := coherent st id evs₂ h₂
+  exact ⟨a.1.trans (same.1.trans b.1.symm), a.2.trans (same.2.trans b.2.symm)⟩
 
 end Weft.ViewCoherence
