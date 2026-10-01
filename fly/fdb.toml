@@ -61,24 +61,12 @@ primary_region = "sjc"
   destination = "/data"
 
 # The backup freshness check, read from the health file backup-fresh.sh
-# maintains: fresh means the newest data/ object in the bucket is younger than
-# WEFT_BACKUP_MAX_AGE. It lives here because this machine already holds the
-# bucket credentials -- CI has no production access, and the spend keeper's
-# authority does not grow a monitoring pattern. A stale backup fails a check
-# in `fly status` instead of surfacing at restore time.
+# maintains for the R2 tag dr, the only backup since the Tigris tag was retired
+# (RFD 2143): fresh means the tag is restorable and its newest complete log is
+# within WEFT_BACKUP_MAX_BEHIND. It lives here because this machine already
+# holds the bucket credentials -- CI has no production access. A stale backup
+# fails a check in `fly status` instead of surfacing at restore time.
 [checks]
-  [checks.backup_fresh]
-    type = "http"
-    port = 8081
-    path = "/health"
-    interval = "2m"
-    timeout = "10s"
-    grace_period = "10m"
-
-  # The DR-tag freshness gate, per RFD 2143. Publishes /dr from the second
-  # backup-fresh loop, and fails critical when the R2 tag stops running or
-  # its newest log is older than WEFT_BACKUP_MAX_AGE -- the same threshold
-  # backup_fresh uses for the Tigris tag.
   [checks.backup_fresh_dr]
     type = "http"
     port = 8081
