@@ -396,6 +396,12 @@ else
 	log "no R2 blob store: DR tag is not configured on this machine"
 fi
 
+# Each process's share of 80 per cent of the VM, a quarter of it page cache; fly.toml may override.
+total_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+mem_mib=${WEFT_FDB_MEMORY_MIB:-$((total_kib * 8 / 10 / 1024 / PROCS))}
+cache_mib=${WEFT_FDB_CACHE_MIB:-$((mem_mib / 4))}
+log "memory ${mem_mib}MiB and cache_memory ${cache_mib}MiB per process, from MemTotal ${total_kib} KiB over $PROCS processes"
+
 conf=/etc/foundationdb/foundationdb.conf
 {
 	echo "[fdbmonitor]"
@@ -423,6 +429,10 @@ conf=/etc/foundationdb/foundationdb.conf
 	echo "locality_zoneid = ${FLY_MACHINE_ID:-$self}"
 	echo "locality_machineid = ${FLY_MACHINE_ID:-$self}"
 	echo "locality_dcid = ${FLY_REGION:-unknown}"
+	# FoundationDB's defaults (memory 8GiB, cache_memory 2GiB) assume a server, so on a small VM
+	# the kernel kills a process before FoundationDB sheds anything. Size both from this VM.
+	echo "memory = ${mem_mib}MiB"
+	echo "cache_memory = ${cache_mib}MiB"
 	i=0
 	while [ "$i" -lt "$PROCS" ]; do
 		echo ""
