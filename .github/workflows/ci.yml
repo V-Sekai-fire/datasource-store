@@ -58,7 +58,7 @@ jobs:
       # `deps` fails rather than skips when FoundationDB is absent, so a broken install
       # above stops here instead of turning the rest of the run into silent passes.
       - name: The commit stage
-        run: ./ci.sh deps build surface handoff integrity big-commit parallel-commit crash vfs-ext
+        run: ./ci.sh deps build surface handoff fence-read integrity big-commit parallel-commit crash vfs-ext
 
   keys-witness:
     runs-on: ubuntu-24.04

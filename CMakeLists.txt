@@ -63,7 +63,7 @@ endforeach()
 #
 #   cmake --build BUILD --target fixtures
 add_custom_target(fixtures)
-foreach(prog prove_handoff prove_crash prove_parallel_commit)
+foreach(prog prove_handoff prove_crash prove_parallel_commit prove_fence_read)
   add_executable(${prog} EXCLUDE_FROM_ALL ${prog}.c)
   target_link_libraries(${prog} PRIVATE weft_fdb_vfs)
   add_dependencies(fixtures ${prog})

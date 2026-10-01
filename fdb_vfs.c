@@ -53,6 +53,10 @@
 // single writer of its own store, so the statement is true. It was worth more than the
 // layout of the pages; weft's `docs/logbook/store.md` holds the number.
 //
+// A reader is the exception. A handle opened read-only keeps NORMAL locking, so SQLite
+// re-reads page 1 at each transaction, finds the head where the change counter would be,
+// and drops its cache when a commit has moved it. See `check_view`.
+//
 // Every transaction runs in the retry loop that FoundationDB documents.
 // `fdb_transaction_on_error` decides if an error may be retried, and waits before the
 // next attempt. A fence mismatch is not retried, because refusing the write is the
@@ -147,6 +151,19 @@ void weft_fdb_stop(void);
 
 static long g_crash_at;
 static long g_commits;
+
+// `WEFT_PLANT_STALE_VIEW=1` plants the defect `check_view` fixes: a read transaction that
+// checks nothing. `prove_fence_read` runs under it to show the fixture fails on the broken
+// VFS, because a check that passes on known-broken input certifies the defect. Inert when
+// the variable is not set.
+static int g_plant_stale_view = -1;
+static int plant_stale_view(void) {
+	if (g_plant_stale_view < 0) {
+		const char *v = getenv("WEFT_PLANT_STALE_VIEW");
+		g_plant_stale_view = v && *v && strcmp(v, "0") != 0;
+	}
+	return g_plant_stale_view;
+}
 
 static void crash_point(void) {
 	if (g_crash_at && ++g_commits == g_crash_at) {
@@ -351,6 +368,10 @@ typedef struct {
 	sqlite3_file base;
 	char name[MAX_NAME];
 	int64_t fence;
+	int readonly; // opened with SQLITE_OPEN_READONLY, so no fence: the view is HEAD and the shard
+	// SQLite holds no page it will use before re-reading the header: set at open and at
+	// every unlock to none, cleared by every read. Only `check_view` reads it.
+	int cache_droppable;
 
 	uint64_t head;        // the newest commit
 	uint64_t shard_as_of; // the newest shard version
@@ -415,6 +436,8 @@ typedef struct {
 // transaction lifetime is about to expire or a commit has moved the head. A
 // retryable error drops the cached tr and falls through to a fresh transaction,
 // same as `run_txn`.
+static fdb_error_t check_view(FDBTransaction *tr, FdbFile *f, int *final);
+
 static int run_read_txn(txn_body body, void *ctx, FdbFile *f) {
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
@@ -434,7 +457,10 @@ static int run_read_txn(txn_body body, void *ctx, FdbFile *f) {
 
 	for (;;) {
 		int final = 0;
-		fdb_error_t err = body(tr, ctx, &final);
+		// The view is checked once per transaction, not once per read: every read in it is
+		// at the one read version the check saw.
+		fdb_error_t err = check_view(tr, f, &final);
+		if (!err && !final) err = body(tr, ctx, &final);
 		if (final) {
 			fdb_transaction_destroy(tr);
 			return final;
@@ -971,11 +997,31 @@ static fdb_error_t read_body(FDBTransaction *tr, void *ctx, int *final) {
 	return 0;
 }
 
+// Overlay four big-endian bytes at `at` onto a read of [off, off + amt).
+static void overlay_u32(uint8_t *buf, int amt, sqlite3_int64 off, sqlite3_int64 at, uint32_t v) {
+	uint8_t be[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+	for (int i = 0; i < 4; i++) {
+		sqlite3_int64 pos = at + i - off;
+		if (pos >= 0 && pos < amt) buf[pos] = be[i];
+	}
+}
+
 static int fdb_read(sqlite3_file *file, void *buf, int amt, sqlite3_int64 off) {
 	FdbFile *f = (FdbFile *)file;
 	struct read_ctx r = {f, buf, amt, off, 0};
 	int rc = run_read_txn(read_body, &r, f);
 	if (rc != SQLITE_OK) return rc;
+	f->cache_droppable = 0; // SQLite now holds a page it may use without re-reading the header
+
+	// A reader's change counter is the head. The header's own counter (byte 24) stops
+	// moving once the writer holds EXCLUSIVE locking, and it is the counter SQLite compares
+	// at the start of a transaction to decide whether its page cache is still good. Byte 92
+	// is the counter the header's page count was valid for, and it is kept equal so SQLite
+	// goes on trusting that count. See `check_view`.
+	if (f->readonly && off < 96) {
+		overlay_u32(buf, amt, off, 24, (uint32_t)f->head);
+		overlay_u32(buf, amt, off, 92, (uint32_t)f->head);
+	}
 	// SQLite needs the short-read code so it can zero-fill and grow the file.
 	return r.short_read ? SQLITE_IOERR_SHORT_READ : SQLITE_OK;
 }
@@ -1019,7 +1065,7 @@ static DirtyPage *buffer_page(FdbFile *file, uint32_t pgno, int whole, int *rc) 
 		int hit_len = 0, hit_present = 0;
 		if (!ra_hit(file, pgno, stored, &hit_len, &hit_present)) {
 			struct read_ctx r = {file, stored, PAGE, (sqlite3_int64)pgno * PAGE, 0};
-			int err = run_txn(read_body, &r, 0, SQLITE_IOERR_READ);
+			int err = run_read_txn(read_body, &r, file);
 			if (err != SQLITE_OK && err != SQLITE_IOERR_SHORT_READ) {
 				*rc = err;
 				return NULL;
@@ -1099,6 +1145,82 @@ static fdb_error_t check_fence(FDBTransaction *tr, FdbFile *file, int *final) {
 	// Refusing the write is the correct answer, so it must reach the caller instead of
 	// being retried.
 	if (!got || (int64_t)fence != file->fence) *final = SQLITE_READONLY;
+	return 0;
+}
+
+// Refuse a read unless the store is still the one this handle's cache was built on.
+//
+// A handle caches pages: SQLite's page cache under EXCLUSIVE locking, the dirty buffer and
+// the read-ahead window. A fence that moved means another writer has changed the store, so
+// a page read now and a page cached earlier come from two databases, and a B-tree assembled
+// from both is corrupt. SQLite trusts a page it is handed and follows a pointer off its end:
+// Uro's upload after a lost fence was a SIGSEGV in sqlite3BtreeInsert. The fence covered
+// every write transaction and no read transaction, and a fence that covers one path and not
+// the others is not a fence. `spec/ViewCoherence.lean` enumerates every body and proves the
+// file-scoped ones check.
+//
+// A writer's view is its fence, and a stale writer fails every time, because the database
+// it was reading is not there any more.
+//
+// A reader holds no fence, so its view is the head and the shard version it loaded. A fold
+// moves the shard and changes no page, so the view is reloaded and the read goes on. A
+// commit moves the head, and the reader's cache is then wrong unless SQLite is about to
+// drop it. SQLite drops it when the header's change counter differs from the one it holds,
+// which it reads at the start of every transaction under NORMAL locking and never under
+// EXCLUSIVE, and a writer under EXCLUSIVE locking stops bumping that counter after its
+// first commit. So `fdb_read` reports the head as a reader's change counter, and the moved
+// head is reloaded only when SQLite is between transactions (`cache_droppable`, set by
+// `fdb_unlock`). Inside a transaction, or under EXCLUSIVE locking, the read is refused and
+// stays refused: an I/O error does not empty SQLite's cache either, so the handle reopens.
+//
+// The check runs when a read transaction starts, and every read in that transaction is at
+// the read version it saw, so a handle reads one store state per transaction: its own, or
+// nothing. A cached transaction is replaced after four seconds, after a refused write, and
+// for a handle under NORMAL locking at the end of each SQLite transaction (`fdb_unlock`).
+//
+// This is what keeps a SQLite transaction inside FoundationDB's semantics when it outlives
+// one FoundationDB transaction, which a long read does at the four-second mark and a large
+// commit does by staging. A SQLite transaction sees one store state, as a FoundationDB
+// transaction does: each later read version it runs on is either the same state, because
+// the fence or the head has not moved, or it is refused. Staged pages are the write side of
+// the same rule, invisible until the head moves.
+//
+// What this cannot reach is a read SQLite answers from its own cache without calling the
+// VFS. Under EXCLUSIVE locking that is by design, and it hands SQLite nothing from the
+// store, so no page is mixed. A reader that wants to follow the head keeps NORMAL locking,
+// where SQLite reads page 1 at every transaction and this check runs.
+static fdb_error_t check_view(FDBTransaction *tr, FdbFile *f, int *final) {
+	if (plant_stale_view()) return 0;
+	if (!f->readonly) {
+		fdb_error_t err = check_fence(tr, f, final);
+		if (!err && *final) *final = SQLITE_IOERR_READ;
+		return err;
+	}
+
+	uint8_t key[KEYMAX], from[KEYMAX], to[KEYMAX];
+	uint64_t head = 0, as_of = 0;
+	int got = 0, found = 0;
+
+	int klen = key_meta(key, f->name, "HEAD");
+	fdb_error_t err = get_u64(tr, key, klen, &head, &got);
+	if (err) return err;
+	if (!got) head = 0;
+
+	int flen = key_prefix(from, f->name, "SHARDN");
+	int tlen = key_shardn(to, f->name, head + 1);
+	if ((err = edge_number(tr, from, flen, to, tlen, 1, &as_of, &found))) return err;
+
+	if (head == f->head && found == f->has_shard && (!found || as_of == f->shard_as_of)) return 0;
+
+	if (head != f->head && !f->cache_droppable) {
+		*final = SQLITE_IOERR_READ;
+		return 0;
+	}
+	if ((err = load_head(tr, f))) return err;
+	if ((err = load_newest_shard(tr, f))) return err;
+	f->sent_size = f->size;
+	f->cache_droppable = 0;
+	ra_reset(f);
 	return 0;
 }
 
@@ -1205,17 +1327,26 @@ static int flush(FdbFile *f) {
 
 	if (f->ndirty <= ONE_TXN_PAGES) {
 		rc = run_txn(commit_body, &c, 1, SQLITE_IOERR_WRITE);
-		if (rc != SQLITE_OK) return rc;
 	} else {
-		for (int lo = 0; lo < f->ndirty; lo += STAGE_TXN_PAGES) {
+		rc = SQLITE_OK;
+		for (int lo = 0; lo < f->ndirty && rc == SQLITE_OK; lo += STAGE_TXN_PAGES) {
 			c.lo = lo;
 			c.hi = lo + STAGE_TXN_PAGES;
 			if (c.hi > f->ndirty) c.hi = f->ndirty;
 			rc = run_txn(delta_body, &c, 1, SQLITE_IOERR_WRITE);
-			if (rc != SQLITE_OK) return rc;
 		}
-		rc = run_txn(head_body, &c, 1, SQLITE_IOERR_WRITE);
-		if (rc != SQLITE_OK) return rc;
+		if (rc == SQLITE_OK) rc = run_txn(head_body, &c, 1, SQLITE_IOERR_WRITE);
+	}
+	if (rc != SQLITE_OK) {
+		// A refused write told this handle the fence moved. Its cached read transaction is a
+		// snapshot of the store it used to own, so the next read starts a fresh one and
+		// `check_view` refuses it, rather than reading the old snapshot until the four
+		// seconds run out.
+		if (rc == SQLITE_READONLY && f->ro_tr) {
+			fdb_transaction_destroy(f->ro_tr);
+			f->ro_tr = NULL;
+		}
+		return rc;
 	}
 
 	f->head = c.txid;
@@ -1264,9 +1395,11 @@ struct fold_ctx {
 // Read a window of pages through the read path, so the fold sees exactly what a reader
 // sees. Memory stays bounded by one window, so compaction does not load the database.
 static fdb_error_t fold_read_body(FDBTransaction *tr, void *ctx, int *final) {
-	(void)final;
 	struct fold_ctx *c = ctx;
 	memset(c->present, 0, c->hi - c->lo);
+
+	fdb_error_t err = check_fence(tr, c->f, final);
+	if (err || *final) return err;
 
 	for (uint32_t pgno = c->lo; pgno < c->hi; pgno++) {
 		int len = 0, present = 0;
@@ -2066,7 +2199,23 @@ static int fdb_close(sqlite3_file *file) {
 
 // The actor owns its store and is the single writer, so a lock is not needed.
 static int fdb_lock(sqlite3_file *f, int l) { (void)f; (void)l; return SQLITE_OK; }
-static int fdb_unlock(sqlite3_file *f, int l) { (void)f; (void)l; return SQLITE_OK; }
+
+// Under NORMAL locking SQLite drops to no lock at the end of every transaction, and that is
+// the moment a handle following the head wants a fresh read version: the next transaction
+// then starts a new FoundationDB transaction, `check_view` runs, and a moved head is seen
+// now rather than when the cached transaction's four seconds run out. Under EXCLUSIVE
+// locking this is never called, and the cache lives as before.
+static int fdb_unlock(sqlite3_file *file, int l) {
+	FdbFile *f = (FdbFile *)file;
+	if (l == SQLITE_LOCK_NONE) {
+		f->cache_droppable = 1;
+		if (f->ro_tr) {
+			fdb_transaction_destroy(f->ro_tr);
+			f->ro_tr = NULL;
+		}
+	}
+	return SQLITE_OK;
+}
 static int fdb_check_lock(sqlite3_file *f, int *out) { (void)f; *out = 0; return SQLITE_OK; }
 
 static int fdb_control(sqlite3_file *file, int op, void *arg) {
@@ -2131,6 +2280,8 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	// The cost is one range read for each open. Records are dropped as they are decided, so
 	// in the steady state that read finds nothing and the sweep stops.
 	const int readonly = (flags & SQLITE_OPEN_READONLY) != 0;
+	f->readonly = readonly;
+	f->cache_droppable = 1; // nothing is cached yet
 	int rc = readonly ? SQLITE_OK : weft_txn_recover();
 	if (rc != SQLITE_OK) return rc;
 

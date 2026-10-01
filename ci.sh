@@ -27,7 +27,7 @@ KEYS_WITNESS_BUILD=${KEYS_WITNESS_BUILD:-build-keys-witness}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff integrity big-commit parallel-commit crash vfs-ext keys-witness backup-fresh spec tla'
+ALL='deps build surface handoff fence-read integrity big-commit parallel-commit crash vfs-ext keys-witness backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -134,6 +134,29 @@ stage_handoff() {
 }
 
 # SQLite's own audit of its B-tree, over a database that lives in FoundationDB.
+# A stale handle is refused a read, and the fixture fails on the VFS with the check planted
+# out. The second run is the negative control: a check that passes on known-broken input
+# certifies the defect, so a control that passes is itself the failure.
+stage_fence_read() {
+	need_fixtures || return 1
+	mkdir -p "$RUN"
+	(
+		cd "$RUN"
+		"$here/$BUILD/prove_fence_read" writer zone-fence-writer.db
+		"$here/$BUILD/prove_fence_read" reader zone-fence-reader.db
+		"$here/$BUILD/prove_fence_read" reader-exclusive zone-fence-reader-x.db
+		for mode in writer reader; do
+			if WEFT_PLANT_STALE_VIEW=1 "$here/$BUILD/prove_fence_read" "$mode" "zone-fence-plant-$mode.db" \
+				> plant.txt 2>&1; then
+				cat plant.txt
+				echo "the $mode fixture passed on a VFS with the view check planted out; it checks nothing"
+				exit 1
+			fi
+			echo "control: with WEFT_PLANT_STALE_VIEW=1 the $mode fixture fails, as it must"
+		done
+	)
+}
+
 stage_integrity() {
 	mkdir -p "$RUN"
 	(cd "$RUN" && "$here/$BUILD/integrity" zone-atlantis.db)
@@ -280,6 +303,7 @@ stage_backup_fresh() {
 # run, and the only one that needs Lean.
 stage_spec() {
 	command -v lake >/dev/null 2>&1 || { echo "missing: lake (elan/Lean toolchain)"; return 1; }
+	spec/check_bodies.sh
 	(cd spec && lake build)
 }
 
