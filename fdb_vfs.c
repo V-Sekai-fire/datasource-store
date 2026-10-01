@@ -813,6 +813,7 @@ static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno
 
 struct open_ctx {
 	FdbFile *f;
+	int readonly;
 };
 
 // Where the database stands: the newest commit and the file size.
@@ -906,6 +907,12 @@ static fdb_error_t open_body(FDBTransaction *tr, void *ctx, int *final) {
 
 	if ((err = load_head(tr, file))) return err;
 	if ((err = load_newest_shard(tr, file))) return err;
+	// A reader follows the committed head, so it neither tidies a writer's unfinished
+	// commit nor takes the fence a writer needs.
+	if (((struct open_ctx *)ctx)->readonly) {
+		file->sent_size = file->size;
+		return 0;
+	}
 	drop_unfinished_commit(tr, file);
 	if ((err = raise_fence(tr, file))) return err;
 
@@ -2123,10 +2130,11 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	//
 	// The cost is one range read for each open. Records are dropped as they are decided, so
 	// in the steady state that read finds nothing and the sweep stops.
-	int rc = weft_txn_recover();
+	const int readonly = (flags & SQLITE_OPEN_READONLY) != 0;
+	int rc = readonly ? SQLITE_OK : weft_txn_recover();
 	if (rc != SQLITE_OK) return rc;
 
-	struct open_ctx c = {f};
+	struct open_ctx c = {f, readonly};
 	rc = run_txn(open_body, &c, 1, SQLITE_IOERR);
 	if (rc != SQLITE_OK) return rc;
 
