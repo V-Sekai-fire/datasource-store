@@ -80,7 +80,7 @@ jobs:
         env:
           CC: clang
           CXX: clang++
-        run: ./ci.sh keys-witness
+        run: ./ci.sh keys-witness backup-fresh
 
   # The parallel-commit protocol against the spec it claims to be. Needs Java and the TLA+
   # tools, and neither FoundationDB nor SQLite: it checks a specification, not a run.
