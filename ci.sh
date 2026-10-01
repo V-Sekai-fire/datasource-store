@@ -27,7 +27,7 @@ KEYS_WITNESS_BUILD=${KEYS_WITNESS_BUILD:-build-keys-witness}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff integrity big-commit parallel-commit crash keys-witness backup-fresh spec tla'
+ALL='deps build surface handoff integrity big-commit parallel-commit crash vfs-ext keys-witness backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -198,6 +198,49 @@ stage_crash() {
 		echo "every crash point landed in setup, so this stage asserted nothing"
 		return 1
 	fi
+}
+
+# The VFS loaded as an extension into a SQLite shell that does not link it, the way exqlite
+# loads it. Rows must outlive the process and be FoundationDB keys, not a local file.
+stage_vfs_ext() {
+	sq=${SQLITE3:-sqlite3}
+	command -v "$sq" >/dev/null 2>&1 || { echo "missing: $sq (the SQLite shell)"; return 1; }
+	[ -f "$BUILD/CMakeCache.txt" ] || cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo} || return 1
+	cmake --build "$BUILD" --target weftfdb || return 1
+	ext=$(cd "$BUILD" && pwd)/weftfdb
+	db=ci_ext_$$
+	open="PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=MEMORY;"
+	count() { "$sq" :memory: ".load $ext" ".open file:$db?vfs=weft_fdb" "$open" "SELECT count(*) FROM t;" | tail -1; }
+
+	if "$sq" "file:$db?vfs=weft_fdb" 'SELECT 1' >/dev/null 2>&1; then
+		echo "control failed: weft_fdb opened without the extension loaded"; return 1
+	fi
+	echo "ok   control: without the extension there is no weft_fdb VFS"
+
+	"$sq" :memory: ".load $ext" ".open file:$db?vfs=weft_fdb" "$open" \
+		"CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT);" \
+		"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 300) INSERT INTO t(v) SELECT 'row ' || x FROM c;" >/dev/null || return 1
+	n=$(count)
+	[ "$n" = 300 ] || { echo "a second process read $n rows, not 300"; return 1; }
+	echo "ok   300 rows written through the extension read back from a second process"
+
+	keys=$(fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "getrangekeys weft/db/$db/ weft/db/${db}0 100" 2>/dev/null | grep -c "weft/db/$db/")
+	[ "$keys" -gt 0 ] || { echo "no FoundationDB keys under weft/db/$db/"; return 1; }
+	[ ! -e "$db" ] || { echo "a local file named $db exists, so the VFS wrote to disk"; return 1; }
+	echo "ok   the rows are $keys FoundationDB keys under weft/db/$db/, and no local file"
+
+	out=$("$sq" :memory: ".load $ext" ".open file:$db?vfs=weft_fdb" "$open" \
+		".connection 1" ".open file:$db?vfs=weft_fdb" "$open" \
+		".connection 0" "INSERT INTO t(v) VALUES('stale writer');" 2>&1)
+	case "$out" in
+	*readonly*) ;;
+	*) echo "control failed: a superseded connection's write was not refused: $out"; return 1 ;;
+	esac
+	n=$(count)
+	[ "$n" = 300 ] || { echo "after the refused write the table holds $n rows, not 300"; return 1; }
+	echo "ok   control: a second open raises the fence, and the first connection's write is refused"
+
+	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
 # `fdb_keys.h` is pure, which is why it was split out: this needs neither FoundationDB nor
