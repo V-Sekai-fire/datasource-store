@@ -240,6 +240,7 @@ stage_vfs_ext() {
 	[ "$n" = 300 ] || { echo "after the refused write the table holds $n rows, not 300"; return 1; }
 	echo "ok   control: a second open raises the fence, and the first connection's write is refused"
 
+	# The shell stops at its first failing SQL argument, so the refused reader write runs last.
 	fence() { fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "get weft/db/$db/FENCE" 2>/dev/null | tail -1; }
 	before=$(fence)
 	"$sq" :memory: ".load $ext" ".open file:$db?vfs=weft_fdb&mode=ro" "SELECT count(*) FROM t;" >/dev/null || return 1
@@ -247,8 +248,8 @@ stage_vfs_ext() {
 	[ -n "$before" ] && [ "$before" = "$after" ] || { echo "a read-only open moved the fence: $before -> $after"; return 1; }
 	out=$("$sq" :memory: ".load $ext" ".open file:$db?vfs=weft_fdb" "$open" \
 		".connection 1" ".open file:$db?vfs=weft_fdb&mode=ro" "SELECT count(*) FROM t;" \
-		"INSERT INTO t(v) VALUES('reader');" \
-		".connection 0" "INSERT INTO t(v) VALUES('writer after a reader');" 2>&1)
+		".connection 0" "INSERT INTO t(v) VALUES('writer after a reader');" \
+		".connection 1" "INSERT INTO t(v) VALUES('reader');" 2>&1)
 	case "$out" in
 	*readonly*) ;;
 	*) echo "a read-only connection's write was not refused: $out"; return 1 ;;
