@@ -52,13 +52,13 @@ jobs:
             sleep 2
           done
 
-      - name: Install SQLite headers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+      - name: Install SQLite headers and shell
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev sqlite3
 
       # `deps` fails rather than skips when FoundationDB is absent, so a broken install
       # above stops here instead of turning the rest of the run into silent passes.
       - name: The commit stage
-        run: ./ci.sh deps build surface handoff integrity big-commit parallel-commit crash
+        run: ./ci.sh deps build surface handoff integrity big-commit parallel-commit crash vfs-ext
 
   keys-witness:
     runs-on: ubuntu-24.04
@@ -118,3 +118,34 @@ jobs:
           build: true
           test: false
           lint: false
+
+  # The loadable extension on Apple Silicon, where a Mac desk runs Uro's development copy.
+  # Homebrew's SQLite, because the shell macOS ships cannot load extensions.
+  vfs-ext-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      FDB_VERSION: "7.3.76"
+      WEFT_FDB_CLUSTER_FILE: /usr/local/etc/foundationdb/fdb.cluster
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install FoundationDB
+        run: |
+          curl -fsSL -o fdb.pkg \
+            "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/FoundationDB-${FDB_VERSION}_arm64.pkg"
+          sudo installer -pkg fdb.pkg -target /
+          for i in $(seq 1 30); do
+            fdbcli --exec 'status minimal' | grep -q 'The database is available' && break
+            sleep 2
+          done
+
+      - name: Install SQLite
+        run: brew install sqlite
+
+      - name: The VFS as a loadable extension
+        run: |
+          sq=$(brew --prefix sqlite)
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSQLITE_INCLUDE_DIR="$sq/include" -DSQLITE_LIBRARY="$sq/lib/libsqlite3.dylib"
+          SQLITE3="$sq/bin/sqlite3" ./ci.sh vfs-ext

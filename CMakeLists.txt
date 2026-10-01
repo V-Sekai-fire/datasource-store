@@ -22,15 +22,24 @@ find_path(SQLITE_INCLUDE_DIR sqlite3.h REQUIRED)
 find_library(SQLITE_LIBRARY NAMES sqlite3 REQUIRED)
 
 add_library(weft_fdb_vfs STATIC fdb_vfs.c)
-# The SQLite loadable-extension target below links this static library
-# into a shared object, and ld refuses the R_X86_64_PC32 relocations
-# emitted for a non-PIC static without this. -fPIC has no measurable
-# cost on x86_64 for a VFS this small.
+# Position-independent, so the library can be linked into a shared object.
 set_property(TARGET weft_fdb_vfs PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(weft_fdb_vfs PUBLIC
   ${FDB_INCLUDE_DIR}/foundationdb ${SQLITE_INCLUDE_DIR})
 target_compile_definitions(weft_fdb_vfs PUBLIC FDB_API_VERSION=730)
 target_link_libraries(weft_fdb_vfs PUBLIC ${FDB_LIBRARY} ${SQLITE_LIBRARY} Threads::Threads)
+
+# The VFS as a loadable extension for a host that brings its own SQLite (exqlite in the BEAM).
+# fdb_vfs_ext.c compiles fdb_vfs.c against sqlite3ext.h, so the module links no SQLite.
+add_library(weftfdb MODULE fdb_vfs_ext.c)
+set_target_properties(weftfdb PROPERTIES PREFIX "" POSITION_INDEPENDENT_CODE ON)
+if(APPLE)
+  set_target_properties(weftfdb PROPERTIES SUFFIX ".dylib")
+endif()
+target_include_directories(weftfdb PRIVATE
+  ${FDB_INCLUDE_DIR}/foundationdb ${SQLITE_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(weftfdb PRIVATE FDB_API_VERSION=730)
+target_link_libraries(weftfdb PRIVATE ${FDB_LIBRARY} Threads::Threads)
 
 # The programs that assert something in-process. These are the default build: each opens a
 # database, checks a property and exits, so a plain `cmake --build` produces exactly the set
