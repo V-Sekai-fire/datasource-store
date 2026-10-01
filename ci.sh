@@ -240,6 +240,23 @@ stage_vfs_ext() {
 	[ "$n" = 300 ] || { echo "after the refused write the table holds $n rows, not 300"; return 1; }
 	echo "ok   control: a second open raises the fence, and the first connection's write is refused"
 
+	fence() { fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "get weft/db/$db/FENCE" 2>/dev/null | tail -1; }
+	before=$(fence)
+	"$sq" :memory: ".load $ext" ".open file:$db?vfs=weft_fdb&mode=ro" "SELECT count(*) FROM t;" >/dev/null || return 1
+	after=$(fence)
+	[ -n "$before" ] && [ "$before" = "$after" ] || { echo "a read-only open moved the fence: $before -> $after"; return 1; }
+	out=$("$sq" :memory: ".load $ext" ".open file:$db?vfs=weft_fdb" "$open" \
+		".connection 1" ".open file:$db?vfs=weft_fdb&mode=ro" "SELECT count(*) FROM t;" \
+		"INSERT INTO t(v) VALUES('reader');" \
+		".connection 0" "INSERT INTO t(v) VALUES('writer after a reader');" 2>&1)
+	case "$out" in
+	*readonly*) ;;
+	*) echo "a read-only connection's write was not refused: $out"; return 1 ;;
+	esac
+	n=$(count)
+	[ "$n" = 301 ] || { echo "with a reader attached the writer's insert left $n rows, not 301"; return 1; }
+	echo "ok   a read-only open leaves the fence alone, its own write is refused, and the writer keeps writing"
+
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
