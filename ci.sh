@@ -254,7 +254,7 @@ stage_vfs_ext() {
 	*) echo "a read-only connection's write was not refused: $out"; return 1 ;;
 	esac
 	n=$(count)
-	[ "$n" = 301 ] || { echo "with a reader attached the writer's insert left $n rows, not 301"; return 1; }
+	[ "$n" = 301 ] || { echo "with a reader attached the writer's insert left $n rows, not 301:"; echo "$out"; return 1; }
 	echo "ok   a read-only open leaves the fence alone, its own write is refused, and the writer keeps writing"
 
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
