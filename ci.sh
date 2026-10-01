@@ -27,7 +27,7 @@ KEYS_WITNESS_BUILD=${KEYS_WITNESS_BUILD:-build-keys-witness}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff integrity big-commit parallel-commit crash keys-witness spec tla'
+ALL='deps build surface handoff integrity big-commit parallel-commit crash keys-witness backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -207,6 +207,12 @@ stage_keys_witness() {
 	cmake -S keys-witness -B "$KEYS_WITNESS_BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo
 	cmake --build "$KEYS_WITNESS_BUILD" -j"${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 	ctest --test-dir "$KEYS_WITNESS_BUILD" --output-on-failure
+}
+
+# The probe weftspun-fdb's backup checks read, run against its own controls before a machine
+# arms it, so a regression fails here rather than leaving a production check critical.
+stage_backup_fresh() {
+	sh fly/backup-fresh.sh --self-test
 }
 
 # The read-ahead window's safety argument. The only stage that checks a proof rather than a

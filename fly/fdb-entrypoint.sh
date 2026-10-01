@@ -328,21 +328,10 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	log "backup url in $backup_url -- fdbbackup start -z -d \"\$(cat $backup_url)\" \\"
 	log "  --blob-credentials $blob_creds --knob_http_request_aws_v4_header=true"
 
-	# Freshness, asserted from the machine that already holds the credentials.
-	# `fdbbackup status` is the process's opinion of itself; the loop measures
-	# the bucket -- the age of the newest data/ object, what a restore would
-	# find -- and publishes a health file that the Fly machine check in
-	# fdb.toml reads over busybox httpd. A stale backup then fails a check in
-	# `fly status` instead of being discovered at restore time. The loop
-	# refuses to arm unless its own controls fire (see backup-fresh.sh).
+	# Freshness of the default tag, published as /health for fdb.toml's machine check;
+	# the loop refuses to arm unless its own controls fire (see backup-fresh.sh).
 	/usr/local/bin/backup-fresh.sh >> /var/log/foundationdb/backup-fresh.log 2>&1 &
-	log "backup freshness check on :8081/health, max age ${WEFT_BACKUP_MAX_AGE:-3600}s"
-
-	if [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
-		/usr/local/bin/backup-fresh.sh --tag dr \
-			>> /var/log/foundationdb/backup-fresh-dr.log 2>&1 &
-		log "DR backup freshness check on :8081/dr, tag dr"
-	fi
+	log "backup freshness check on :8081/health, max ${WEFT_BACKUP_MAX_BEHIND:-3600}s behind"
 
 	# There used to be a second trust bundle here, cluster root plus public roots,
 	# because the agent's one TLS policy covered both peers and the blob store.
@@ -356,8 +345,8 @@ fi
 
 # The DR destination. R2 Infrequent Access, reached through a second stunnel
 # hop for the same SNI reason. Guarded by its own env: a machine without the
-# R2 credentials publishes /cluster-dr = critical rather than passing on
-# nothing, and the negative control fires on the machine check.
+# R2 credentials never writes /dr, so its check is critical rather than
+# passing on nothing, and the negative control fires on the machine check.
 blob_creds_r2=/etc/foundationdb/blob-credentials-r2.json
 backup_r2=0
 if [ -n "${R2_ACCESS_KEY_ID:-}" ] && [ -n "${R2_SECRET_ACCESS_KEY:-}" ] && [ -n "${R2_ENDPOINT_URL:-}" ]; then
@@ -398,6 +387,11 @@ if [ -n "${R2_ACCESS_KEY_ID:-}" ] && [ -n "${R2_SECRET_ACCESS_KEY:-}" ] && [ -n 
 	chmod 0600 "$backup_url_r2"
 
 	log "R2 backup url in $backup_url_r2 -- fdbbackup start -t dr -d \"\$(cat $backup_url_r2)\""
+
+	# Started here rather than beside the default tag's loop: R2 is configured
+	# without Tigris, and the DR check must not depend on a store it never reads.
+	/usr/local/bin/backup-fresh.sh --tag dr >> /var/log/foundationdb/backup-fresh-dr.log 2>&1 &
+	log "DR backup freshness check on :8081/dr, tag dr"
 else
 	log "no R2 blob store: DR tag is not configured on this machine"
 fi
