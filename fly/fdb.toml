@@ -31,7 +31,10 @@ primary_region = "sjc"
   # tolerance is 0 machines. Restore to `double` before real data lands.
   WEFT_FDB_REDUNDANCY = "single"
   WEFT_FDB_STORAGE    = "ssd-2"
-  WEFT_FDB_PROCS      = "2"
+  WEFT_FDB_PROCS      = "1"
+  # One fdbserver capped below the 512 MB VM, leaving room for backup_agent.
+  WEFT_FDB_MEMORY_MIB = "256"
+  WEFT_FDB_CACHE_MIB  = "64"
   WEFT_FDB_DATA       = "/data"
 
   # Peer verification. FoundationDB matches this against the certificate a peer presents, so
@@ -104,6 +107,6 @@ primary_region = "sjc"
 # fdbserver is single-threaded, so WEFT_FDB_PROCS above is one process per core, and
 # a core removed here puts two of them in contention on one.
 [[vm]]
-  memory   = "1gb"
+  memory   = "512mb"
   cpu_kind = "shared"
-  cpus     = 2
+  cpus     = 1
