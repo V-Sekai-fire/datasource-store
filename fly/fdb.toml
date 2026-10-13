@@ -17,7 +17,9 @@ app            = "weftspun-fdb"
 primary_region = "sjc"
 
 [build]
-  dockerfile = "Containerfile.fdb"
+  # Bao runs beside the FDB server (RFD 2147); service-openbao's Dockerfile.colocated builds this
+  # image from the FDB image this repository's Containerfile.fdb produces.
+  image = "registry.fly.io/weftspun-fdb:colocated-20261013204638"
 
 [env]
   # Required by the entrypoint, and deliberately not defaulted there: the count is how the
@@ -25,16 +27,13 @@ primary_region = "sjc"
   # default would form a smaller cluster that reports itself healthy. Change this and the
   # machine count together.
   WEFT_FDB_MACHINES   = "3"
-  # Redundancy dropped from `double` to `single` on 2026-08-31: the cluster carries
-  # 0 MB of user data and the DR path via R2 is being wired up in RFD 2143, so
-  # losing one machine is a cheaper trade than paying to keep the copy. Fault
-  # tolerance is 0 machines. Restore to `double` before real data lands.
-  WEFT_FDB_REDUNDANCY = "single"
+  # `double` with three machines: one machine may be lost (RFD 2147 keeps it while Bao runs here).
+  WEFT_FDB_REDUNDANCY = "double"
   WEFT_FDB_STORAGE    = "ssd-2"
   WEFT_FDB_PROCS      = "1"
-  # One fdbserver capped below the 512 MB VM, leaving room for backup_agent.
-  WEFT_FDB_MEMORY_MIB = "256"
-  WEFT_FDB_CACHE_MIB  = "64"
+  # One fdbserver capped low on the 512 MB VM, leaving room for Bao beside it.
+  WEFT_FDB_MEMORY_MIB = "128"
+  WEFT_FDB_CACHE_MIB  = "32"
   WEFT_FDB_DATA       = "/data"
 
   # Peer verification. FoundationDB matches this against the certificate a peer presents, so
@@ -58,6 +57,16 @@ primary_region = "sjc"
   # Together they say: the Common Name begins `fdb-` and ends `.chibifire.com`, which is the
   # whole of what our CA will issue.
   WEFT_FDB_TLS_VERIFY = "Check.Valid=1,S.CN>=fdb-,S.CN<=.chibifire.com"
+
+# The SSH tunnel to Bao's listener (RFD 2255), balanced across the three machines.
+[[services]]
+  protocol = "tcp"
+  internal_port = 2222
+  auto_stop_machines = "off"
+  min_machines_running = 3
+
+  [[services.ports]]
+    port = 2222
 
 [mounts]
   source      = "fdb_data"
