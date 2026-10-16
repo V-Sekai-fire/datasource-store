@@ -58,6 +58,16 @@ primary_region = "sjc"
   # whole of what our CA will issue.
   WEFT_FDB_TLS_VERIFY = "Check.Valid=1,S.CN>=fdb-,S.CN<=.chibifire.com"
 
+# The SSH tunnel to Bao's listener (RFD 2255), balanced across the three machines.
+[[services]]
+  protocol = "tcp"
+  internal_port = 2222
+  auto_stop_machines = "off"
+  min_machines_running = 3
+
+  [[services.ports]]
+    port = 2222
+
 [mounts]
   source      = "fdb_data"
   destination = "/data"
