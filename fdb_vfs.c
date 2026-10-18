@@ -1445,32 +1445,120 @@ static int should_compact(FdbFile *f) {
 	return f->log_pages > 0 && f->base_pages <= f->log_pages;
 }
 
+// Read every row of [from, to), following `more` until the range is done, and hand each
+// page-keyed row to `each`. The page number is the key's last four bytes.
+typedef void (*page_row)(void *ctx, uint32_t pgno, const uint8_t *val, int vlen);
+
+static fdb_error_t range_pages(FDBTransaction *tr, const uint8_t *from, int flen,
+                               const uint8_t *to, int tlen, page_row each, void *ctx) {
+	uint8_t begin[KEYMAX];
+	int blen = flen;
+	int after = 0;
+	memcpy(begin, from, (size_t)flen);
+	for (;;) {
+		FDBFuture *fu = fdb_transaction_get_range(tr, begin, blen, after, 1, to, tlen, 0, 1, 0, 0,
+		                                          FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+		fdb_error_t err = await(fu);
+		const FDBKeyValue *kv = NULL;
+		int n = 0;
+		fdb_bool_t more = 0;
+		if (!err) err = fdb_future_get_keyvalue_array(fu, &kv, &n, &more);
+		if (!err) {
+			for (int i = 0; i < n; i++) {
+				if (kv[i].key_length < 4) continue;
+				const uint8_t *p = kv[i].key + kv[i].key_length - 4;
+				uint32_t pgno = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+				                | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+				each(ctx, pgno, kv[i].value, kv[i].value_length);
+			}
+			if (more && n > 0 && kv[n - 1].key_length <= KEYMAX) {
+				memcpy(begin, kv[n - 1].key, (size_t)kv[n - 1].key_length);
+				blen = kv[n - 1].key_length;
+				after = 1;
+			} else {
+				more = 0;
+			}
+		}
+		fdb_future_destroy(fu);
+		if (err) return err;
+		if (!more) return 0;
+	}
+}
+
 struct fold_ctx {
 	FdbFile *f;
 	uint64_t as_of;
 	uint32_t lo, hi;  // the window of pages this pass folds
 	uint8_t *pages;   // hi - lo pages
 	uint8_t *present; // one flag for each page in the window
+	uint64_t *owner;  // the txid whose DELTA holds each page, 0 for none
 };
 
-// Read a window of pages through the read path, so the fold sees exactly what a reader
-// sees. Memory stays bounded by one window, so compaction does not load the database.
+static void fold_owner(void *ctx, uint32_t pgno, const uint8_t *val, int vlen) {
+	struct fold_ctx *c = ctx;
+	if (pgno >= c->lo && pgno < c->hi && vlen == 8) c->owner[pgno - c->lo] = get_be64(val);
+}
+
+static void fold_shard(void *ctx, uint32_t pgno, const uint8_t *val, int vlen) {
+	struct fold_ctx *c = ctx;
+	if (pgno < c->lo || pgno >= c->hi || c->owner[pgno - c->lo]) return;
+	memcpy(c->pages + (size_t)(pgno - c->lo) * PAGE, val, (size_t)(vlen > PAGE ? PAGE : vlen));
+	c->present[pgno - c->lo] = 1;
+}
+
+// Read a window of pages with the answers `page_from_store` gives, one page at a time,
+// but pipelined: the index and the shard as two range reads, then every logged page's
+// read in flight at once. Folding a log page by page cost two round trips a page, which
+// was ten seconds at close for a 25 000 row table.
 static fdb_error_t fold_read_body(FDBTransaction *tr, void *ctx, int *final) {
 	struct fold_ctx *c = ctx;
-	memset(c->present, 0, c->hi - c->lo);
+	FdbFile *f = c->f;
+	const uint32_t n = c->hi - c->lo;
+	memset(c->present, 0, n);
+	memset(c->owner, 0, (size_t)n * sizeof(uint64_t));
+	memset(c->pages, 0, (size_t)n * PAGE);
 
-	fdb_error_t err = check_fence(tr, c->f, final);
+	fdb_error_t err = check_fence(tr, f, final);
 	if (err || *final) return err;
 
-	for (uint32_t pgno = c->lo; pgno < c->hi; pgno++) {
-		int len = 0, present = 0;
-		uint8_t *slot = c->pages + (size_t)(pgno - c->lo) * PAGE;
-		memset(slot, 0, PAGE);
-		fdb_error_t err = page_from_store(tr, c->f, pgno, slot, &len, &present);
-		if (err) return err;
-		c->present[pgno - c->lo] = (uint8_t)present;
+	uint8_t from[KEYMAX], to[KEYMAX];
+	int flen = key_pidx(from, f->name, c->lo);
+	int tlen = key_pidx(to, f->name, c->hi);
+	if ((err = range_pages(tr, from, flen, to, tlen, fold_owner, c))) return err;
+
+	if (f->has_shard) {
+		flen = key_shard(from, f->name, f->shard_as_of, c->lo);
+		tlen = key_shard(to, f->name, f->shard_as_of, c->hi);
+		if ((err = range_pages(tr, from, flen, to, tlen, fold_shard, c))) return err;
 	}
-	return 0;
+
+	FDBFuture **fu = calloc(n, sizeof(FDBFuture *));
+	if (!fu) {
+		*final = SQLITE_IOERR_NOMEM;
+		return 0;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (!c->owner[i]) continue;
+		uint8_t key[KEYMAX];
+		int klen = key_delta(key, f->name, c->owner[i], c->lo + i);
+		fu[i] = fdb_transaction_get(tr, key, klen, 0);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (!fu[i]) continue;
+		fdb_error_t e = await(fu[i]);
+		fdb_bool_t have = 0;
+		const uint8_t *val;
+		int vlen;
+		if (!e) e = fdb_future_get_value(fu[i], &have, &val, &vlen);
+		if (!e && have) {
+			memcpy(c->pages + (size_t)i * PAGE, val, (size_t)(vlen > PAGE ? PAGE : vlen));
+			c->present[i] = 1;
+		}
+		if (e && !err) err = e;
+		fdb_future_destroy(fu[i]);
+	}
+	free(fu);
+	return err;
 }
 
 static fdb_error_t fold_write_body(FDBTransaction *tr, void *ctx, int *final) {
@@ -1542,12 +1630,14 @@ static int compact(FdbFile *f) {
 	uint32_t window = STAGE_TXN_PAGES;
 	if (window > npages) window = npages;
 
-	struct fold_ctx c = {f, as_of, 0, 0, NULL, NULL};
+	struct fold_ctx c = {f, as_of, 0, 0, NULL, NULL, NULL};
 	c.pages = malloc((size_t)window * PAGE);
 	c.present = malloc(window);
-	if (!c.pages || !c.present) {
+	c.owner = malloc((size_t)window * sizeof(uint64_t));
+	if (!c.pages || !c.present || !c.owner) {
 		free(c.pages);
 		free(c.present);
+		free(c.owner);
 		return SQLITE_IOERR_NOMEM;
 	}
 
@@ -1565,6 +1655,7 @@ static int compact(FdbFile *f) {
 	}
 	free(c.pages);
 	free(c.present);
+	free(c.owner);
 	if (rc != SQLITE_OK) return rc;
 
 	struct finish_ctx fin = {f, as_of, kept};
