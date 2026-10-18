@@ -9,3 +9,6 @@ require «plausible-witness-dag» from git
 
 @[default_target] lean_exe «crash-search» where
   root := `CrashSearch
+
+lean_exe frontier where
+  root := `Frontier
