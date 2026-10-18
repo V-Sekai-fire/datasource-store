@@ -165,6 +165,30 @@ static int plant_stale_view(void) {
 	return g_plant_stale_view;
 }
 
+// `WEFT_PLANT_TORN_COMMIT=1` plants the defect a one-transaction commit prevents: each page
+// becomes visible in its own transaction, so a crash between two leaves a torn commit. The
+// crash attacks run under it to show they can find a tear. Inert when the variable is not set.
+static int g_plant_torn_commit = -1;
+static int plant_torn_commit(void) {
+	if (g_plant_torn_commit < 0) {
+		const char *v = getenv("WEFT_PLANT_TORN_COMMIT");
+		g_plant_torn_commit = v && *v && strcmp(v, "0") != 0;
+	}
+	return g_plant_torn_commit;
+}
+
+// `WEFT_PLANT_SLOW_COMMIT=1` plants a performance defect: each commit pays one extra read
+// round trip first. The timing attacks run under it to show they can see a slow commit.
+// Inert when the variable is not set.
+static int g_plant_slow_commit = -1;
+static int plant_slow_commit(void) {
+	if (g_plant_slow_commit < 0) {
+		const char *v = getenv("WEFT_PLANT_SLOW_COMMIT");
+		g_plant_slow_commit = v && *v && strcmp(v, "0") != 0;
+	}
+	return g_plant_slow_commit;
+}
+
 static void crash_point(void) {
 	if (g_crash_at && ++g_commits == g_crash_at) {
 		// _exit, so nothing is flushed and no handler runs. This is the crash a machine
@@ -1294,6 +1318,31 @@ static fdb_error_t commit_body(FDBTransaction *tr, void *ctx, int *final) {
 	return put_head(tr, c);
 }
 
+// The planted torn commit: one page, its index row and the head, in one transaction.
+static fdb_error_t torn_body(FDBTransaction *tr, void *ctx, int *final) {
+	struct flush_ctx *c = ctx;
+	FdbFile *f = c->f;
+	uint8_t key[KEYMAX];
+	fdb_error_t err = check_fence(tr, f, final);
+	if (err || *final) return err;
+	put_delta_pages(tr, c);
+	int klen = key_pidx(key, f->name, f->dirty[c->lo]->pgno);
+	set_u64(tr, key, klen, c->txid);
+	klen = key_meta(key, f->name, "SIZE");
+	set_u64(tr, key, klen, (uint64_t)f->size);
+	klen = key_meta(key, f->name, "LOGN");
+	set_u64(tr, key, klen, f->log_pages + (uint64_t)c->hi);
+	klen = key_meta(key, f->name, "HEAD");
+	set_u64(tr, key, klen, c->txid);
+	return 0;
+}
+
+// The planted slow commit: a fence read in a transaction of its own.
+static fdb_error_t slow_body(FDBTransaction *tr, void *ctx, int *final) {
+	struct flush_ctx *c = ctx;
+	return check_fence(tr, c->f, final);
+}
+
 static int compact(FdbFile *f);
 static int should_compact(FdbFile *f);
 
@@ -1325,7 +1374,19 @@ static int flush(FdbFile *f) {
 	struct flush_ctx c = {f, f->head + 1, 0, f->ndirty};
 	int rc;
 
-	if (f->ndirty <= ONE_TXN_PAGES) {
+	if (plant_slow_commit()) {
+		rc = run_txn(slow_body, &c, 0, SQLITE_IOERR_WRITE);
+		if (rc != SQLITE_OK) return rc;
+	}
+
+	if (plant_torn_commit() && f->trunc_pages < 0 && f->ndirty > 0) {
+		rc = SQLITE_OK;
+		for (int lo = 0; lo < f->ndirty && rc == SQLITE_OK; lo++) {
+			c.lo = lo;
+			c.hi = lo + 1;
+			rc = run_txn(torn_body, &c, 1, SQLITE_IOERR_WRITE);
+		}
+	} else if (f->ndirty <= ONE_TXN_PAGES) {
 		rc = run_txn(commit_body, &c, 1, SQLITE_IOERR_WRITE);
 	} else {
 		rc = SQLITE_OK;
