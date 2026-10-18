@@ -27,7 +27,7 @@ KEYS_WITNESS_BUILD=${KEYS_WITNESS_BUILD:-build-keys-witness}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff fence-read integrity big-commit parallel-commit crash vfs-ext keys-witness backup-fresh spec tla'
+ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext keys-witness backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -137,6 +137,21 @@ stage_handoff() {
 # A stale handle is refused a read, and the fixture fails on the VFS with the check planted
 # out. The second run is the negative control: a check that passes on known-broken input
 # certifies the defect, so a control that passes is itself the failure.
+stage_clock() {
+	need_fixtures || return 1
+	mkdir -p "$RUN"
+	(
+		cd "$RUN"
+		"$here/$BUILD/prove_clock" zone-clock.db || exit 1
+		if WEFT_PLANT_UNIX_CLOCK=1 "$here/$BUILD/prove_clock" zone-clock-plant.db > plant.txt 2>&1; then
+			cat plant.txt
+			echo "the clock fixture passed with the clock planted back on \"unix\"->xCurrentTime; it checks nothing"
+			exit 1
+		fi
+		echo "control: with WEFT_PLANT_UNIX_CLOCK=1 the clock fixture fails, as it must"
+	)
+}
+
 stage_fence_read() {
 	need_fixtures || return 1
 	mkdir -p "$RUN"
