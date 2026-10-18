@@ -216,26 +216,47 @@ stage_parallel_commit() {
 # A crash must leave the whole commit or none of it. Walk crash points rather than one,
 # since the fault lives at a particular point and a single delay rarely lands inside a
 # commit. The full space is the Lean search in `witness/`, too long for a pull request.
+#
+# 2000 rows, because at 400 the same points found a planted torn commit in 2 to 7 of 8
+# runs, and at 2000 in 8 of 8 (RFD 2323). The second walk is the negative control: with
+# the torn commit planted, some point must tear.
+crash_walk() {
+	torn=0
+	seeded=0
+	for point in 6 8 10 13 16 21; do
+		echo "=== $1: crash before commit $point ==="
+		# Exit 2 means the crash point was past the end of the sequence, which is not a
+		# fault, so the status is captured rather than left to abort the stage.
+		# Not `rc`: run_stage reads that name after the stage returns.
+		crc=0
+		# A name per run: a database torn by an earlier planted walk fails the writer, and
+		# that failure would count as a tear the plant did not cause.
+		out=$("$here/$BUILD/prove_crash" "crash-$1-$$-$point.db" 2000 at "$point" 2>&1) || crc=$?
+		echo "$out"
+		[ "$crc" = 1 ] && torn=$((torn + 1))
+		case "$out" in *"rows: 0"*) ;; *"rows: "*) seeded=$((seeded + 1)) ;; esac
+	done
+}
+
 stage_crash() {
 	need_fixtures || return 1
 	mkdir -p "$RUN"
 	cd "$RUN"
-	seeded=0
-	for point in 6 8 10 13 16 21; do
-		echo "=== crash before commit $point ==="
-		# Exit 2 means the crash point was past the end of the sequence, which is not a
-		# fault, so the status is captured rather than left to abort the stage.
-		rc=0
-		out=$("$here/$BUILD/prove_crash" "crash-$point.db" 400 at "$point" 2>&1) || rc=$?
-		echo "$out"
-		if [ "$rc" = 1 ]; then echo "torn at crash point $point"; return 1; fi
-		case "$out" in *"rows: 0"*) ;; *"rows: "*) seeded=$((seeded + 1)) ;; esac
-	done
+	crash_walk store
+	if [ "$torn" != 0 ]; then echo "torn at $torn of 6 crash points"; return 1; fi
 	echo "crash points that reached a seeded database: $seeded of 6"
 	if [ "$seeded" = 0 ]; then
 		echo "every crash point landed in setup, so this stage asserted nothing"
 		return 1
 	fi
+	export WEFT_PLANT_TORN_COMMIT=1
+	crash_walk plant
+	unset WEFT_PLANT_TORN_COMMIT
+	if [ "$torn" = 0 ]; then
+		echo "the walk found no tear with a torn commit planted, so it checks nothing"
+		return 1
+	fi
+	echo "control: with WEFT_PLANT_TORN_COMMIT=1, $torn of 6 crash points tear, as they must"
 }
 
 # The VFS loaded as an extension into a SQLite shell that does not link it, the way exqlite
