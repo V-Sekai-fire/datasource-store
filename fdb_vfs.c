@@ -2347,18 +2347,49 @@ static int vfs_fullpath(sqlite3_vfs *vfs, const char *in, int n, char *out) {
 	return SQLITE_OK;
 }
 
+// Randomness, sleep and the clock come from the VFS that was the default when this one
+// registered: "unix" is absent on Windows, and a SQLite built with SQLITE_OMIT_DEPRECATED
+// (exqlite's) has no xCurrentTime, only xCurrentTimeInt64.
+static sqlite3_vfs *g_base;
+
+// `WEFT_PLANT_UNIX_CLOCK=1` plants the defect this replaced: the clock read from "unix"'s
+// xCurrentTime. `prove_clock` runs under it to show the fixture fails on that VFS.
+static int plant_unix_clock(void) {
+	const char *v = getenv("WEFT_PLANT_UNIX_CLOCK");
+	return v && *v && strcmp(v, "0") != 0;
+}
+
 static int vfs_randomness(sqlite3_vfs *vfs, int n, char *out) {
-	return sqlite3_vfs_find("unix")->xRandomness(vfs, n, out);
+	(void)vfs;
+	return g_base->xRandomness(g_base, n, out);
 }
 static int vfs_sleep(sqlite3_vfs *vfs, int micros) {
-	return sqlite3_vfs_find("unix")->xSleep(vfs, micros);
+	(void)vfs;
+	return g_base->xSleep(g_base, micros);
+}
+static int vfs_time64(sqlite3_vfs *vfs, sqlite3_int64 *out) {
+	(void)vfs;
+	double r = 0;
+	int rc;
+	if (plant_unix_clock()) {
+		rc = sqlite3_vfs_find("unix")->xCurrentTime(vfs, &r);
+	} else if (g_base->iVersion >= 2 && g_base->xCurrentTimeInt64) {
+		return g_base->xCurrentTimeInt64(g_base, out);
+	} else {
+		rc = g_base->xCurrentTime(g_base, &r);
+	}
+	*out = (sqlite3_int64)(r * 86400000.0);
+	return rc;
 }
 static int vfs_time(sqlite3_vfs *vfs, double *out) {
-	return sqlite3_vfs_find("unix")->xCurrentTime(vfs, out);
+	sqlite3_int64 t = 0;
+	int rc = vfs_time64(vfs, &t);
+	*out = t / 86400000.0;
+	return rc;
 }
 
 static sqlite3_vfs FDB_VFS = {
-	.iVersion = 1,
+	.iVersion = 2,
 	.szOsFile = sizeof(FdbFile),
 	.mxPathname = MAX_NAME,
 	.zName = "weft_fdb",
@@ -2369,6 +2400,11 @@ static sqlite3_vfs FDB_VFS = {
 	.xRandomness = vfs_randomness,
 	.xSleep = vfs_sleep,
 	.xCurrentTime = vfs_time,
+	.xCurrentTimeInt64 = vfs_time64,
 };
 
-int weft_vfs_register(int make_default) { return sqlite3_vfs_register(&FDB_VFS, make_default); }
+int weft_vfs_register(int make_default) {
+	if (!g_base) g_base = sqlite3_vfs_find(0);
+	if (!g_base || g_base == &FDB_VFS) return SQLITE_ERROR;
+	return sqlite3_vfs_register(&FDB_VFS, make_default);
+}
