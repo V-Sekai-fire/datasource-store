@@ -33,20 +33,31 @@ inductive Kind
   | crash (rows lo hi : Nat)
   | fence (mode : String)
   | perf (rows reps : Nat)
+  /-- A page-delta plant, read back through two folds by `ycsb_direct --verify`. -/
+  | delta (plant : String) (rows : Nat)
+  /-- The YCSB run phase rate, the number the roundtable compares. -/
+  | ycsb (rows workers batch : Nat)
   deriving BEq, Repr, Inhabited
 
 def Kind.family : Kind → Family
   | .crash .. => .roundTrip | .fence _ => .security | .perf .. => .perf
+  | .delta .. => .roundTrip | .ycsb .. => .perf
 
 def Kind.plant : Kind → String
   | .crash .. => "WEFT_PLANT_TORN_COMMIT"
   | .fence _ => "WEFT_PLANT_STALE_VIEW"
   | .perf .. => "WEFT_PLANT_SLOW_COMMIT"
+  | .delta p _ => "WEFT_PLANT_DELTA_" ++ p.toUpper
+  | .ycsb .. => "WEFT_PLANT_SLOW_COMMIT"
+
+def deltaPlants : List String := ["chain", "stale", "fold"]
 
 def Kind.id : Kind → String
   | .crash r lo hi => s!"crash/rows={r}/at={lo}..{hi}"
   | .fence m => s!"fence/{m}"
   | .perf r k => s!"perf/rows={r}/reps={k}"
+  | .delta p r => s!"delta/{p}/rows={r}"
+  | .ycsb r w b => s!"ycsb/rows={r}/workers={w}/batch={b}"
 
 def field (pre s : String) : Option String :=
   if s.startsWith pre then some (s.drop pre.length).toString else none
@@ -66,6 +77,14 @@ def parseKind (id : String) : Option Kind :=
       let rows ← (← field "rows=" r).toNat?
       let reps ← (← field "reps=" k).toNat?
       if 0 < reps then some (.perf rows reps) else none
+  | ["delta", p, r] => do
+      let rows ← (← field "rows=" r).toNat?
+      if deltaPlants.contains p && 0 < rows then some (.delta p rows) else none
+  | ["ycsb", r, w, b] => do
+      let rows ← (← field "rows=" r).toNat?
+      let workers ← (← field "workers=" w).toNat?
+      let batch ← (← field "batch=" b).toNat?
+      if 0 < rows && 0 < workers && 0 < batch then some (.ycsb rows workers batch) else none
   | _ => none
 
 inductive Target | real | planted
@@ -176,7 +195,8 @@ def family (id : String) : Family := ((parseKind id).map Kind.family).getD .roun
 
 /-- The slowest of the real store's recent timed runs, the rate a slow run is measured against. -/
 def baselineRate (runs : List Run) (id : String) : Option Nat :=
-  if (match parseKind id with | some (.perf ..) => false | _ => true) then none else
+  if (match parseKind id with | some (.perf ..) | some (.ycsb ..) => false | _ => true) then none
+  else
   let vs := ((runsOf runs id .real).filter fun r =>
     r.outcome == .baseline || r.outcome == .clean).map (·.value)
   let vs := vs.drop (vs.length - window)
@@ -216,6 +236,11 @@ def mutate (id : String) : List String :=
         [(Kind.crash r lo mid).id, (Kind.crash r (mid + 1) hi).id]
       halves ++ bigger
   | some (.perf r k) => if k < 9 then [(Kind.perf r (k + 2)).id] else []
+  | some (.delta p r) => match [500, 2000, 8000].find? (· > r) with
+      | some r' => [(Kind.delta p r').id]
+      | none => []
+  -- Smaller commits, so the planted round trip is a larger share of the run.
+  | some (.ycsb r w b) => if b ≥ 100 then [(Kind.ycsb r w (b / 10)).id] else []
   | _ => []
 
 /-- Greedy fill in triage order, then by priority. -/
@@ -235,7 +260,7 @@ def plan (levels : List Level) (runs : List Run) (gen changeMs soakMs : Nat) : P
   let ids := levels.map (·.id)
   let cls id := classify runs id
   let calibrated := ids.filter (cls · == .calibrated)
-  let timed id := match parseKind id with | some (.perf ..) => true | _ => false
+  let timed id := match parseKind id with | some (.perf ..) | some (.ycsb ..) => true | _ => false
   let needsBaseline := ids.filter fun id => timed id && (baselineRate runs id).isNone
   let soakable := ids.filter fun id =>
     (cls id == .unknown || cls id == .frontier) && !needsBaseline.contains id
@@ -268,12 +293,29 @@ def mk (seq : Nat) (level : String) (t : Target) (o : Outcome) (ms : Nat := 100)
 def series (level : String) (t : Target) (os : List Outcome) (ms : Nat := 100) : List Run :=
   (os.zip (List.range os.length)).map fun (o, i) => mk i level t o ms
 
+/-- The run phase rate `ycsb_direct` prints, in operations a second. -/
+def runRate (out : String) : Option Nat :=
+  (out.splitOn "\n").findSome? fun line =>
+    if line.startsWith "[RUN]" then
+      match (line.splitOn "throughput=").getLast? with
+      | some t => ((t.splitOn ".").head?.getD "").toNat?
+      | none => none
+    else none
+
 def selfTest : IO UInt32 := do
   let a := "crash/rows=400/at=6..80"
   let b := "fence/writer"
   let all8 := List.replicate 8 Outcome.witness
   let none8 := List.replicate 8 Outcome.clean
   let checks : List (String × Bool) := [
+    ("a delta level reads back as itself",
+      ((parseKind "delta/stale/rows=2000").map Kind.id) == some "delta/stale/rows=2000"),
+    ("a delta level with no such plant is refused",
+      (parseKind "delta/torn/rows=2000").isNone),
+    ("a ycsb level mutates to smaller commits",
+      mutate "ycsb/rows=10000/workers=4/batch=1000" == ["ycsb/rows=10000/workers=4/batch=100"]),
+    ("the run rate is read from the [RUN] line",
+      runRate "[OVERALL] wall_s=1 throughput=5.0 ops/sec\n[RUN] wall_s=2.0 workers=4 throughput=45122.0 ops/sec" == some 45122),
     ("a level that never finds its planted defect is blind",
       classify (series a .planted none8) a == .blind),
     ("a level that finds it eight times in eight is calibrated",
@@ -333,7 +375,8 @@ def draw (seed : Nat) (lo hi : Nat) : Nat :=
 
 def env (k : Kind) (t : Target) : Array (String × Option String) :=
   let off := #[("WEFT_PLANT_TORN_COMMIT", none), ("WEFT_PLANT_STALE_VIEW", none),
-    ("WEFT_PLANT_SLOW_COMMIT", none)]
+    ("WEFT_PLANT_SLOW_COMMIT", none), ("WEFT_PLANT_DELTA_CHAIN", none),
+    ("WEFT_PLANT_DELTA_STALE", none), ("WEFT_PLANT_DELTA_FOLD", none)]
   match t with
   | .real => off
   | .planted => off.map fun (n, v) => if n == k.plant then (n, some "1") else (n, v)
@@ -391,6 +434,38 @@ def runOne (ctx : Ctx) (runs : List Run) (seq : Nat) (id : String) (t : Target) 
             if slow base med then
               pure (0, Outcome.witness, med, s!"{med} commits/s against a floor of {base}")
             else pure (0, Outcome.clean, med, "")
+    | .delta _ rows =>
+        let o ← exec ctx s!"{ctx.bin}/ycsb_direct"
+          #[toString rows, toString rows, "1", "100", "--sorted-load", "--nomutex", "--verify",
+            "--prefix", s!"frontier-{ctx.gen}-{seq}"] k t
+        let out := o.stdout ++ o.stderr
+        if o.exitCode == 0 && (out.splitOn "MISMATCH").length == 1 then
+          pure (0, Outcome.clean, 0, "")
+        else pure (0, Outcome.witness, 0, out)
+    | .ycsb rows workers batch =>
+        let o ← exec ctx s!"{ctx.bin}/ycsb_direct"
+          #[toString rows, toString rows, toString workers,
+            toString batch, "--sorted-load", "--nomutex", "--prefix", s!"frontier-{ctx.gen}-{seq}"] k t
+        let some rate := runRate o.stdout
+          | throw (IO.userError s!"ycsb_direct printed no run rate: {o.stderr}")
+        match baselineRate runs id with
+        | none => pure (0, Outcome.baseline, rate, "")
+        | some base =>
+            if slow base rate then
+              pure (0, Outcome.witness, rate, s!"{rate} ops/s against a floor of {base}")
+            else pure (0, Outcome.clean, rate, "")
+  -- A run leaves its databases behind, and a memory-engine cluster that fills up slows every
+  -- later timed run: four generations of them read as a slow store on the real target.
+  match k with
+  | .delta .. | .ycsb .. =>
+      let pre := s!"weft/db/frontier-{ctx.gen}-{seq}-"
+      let stop := s!"weft/db/frontier-{ctx.gen}-{seq}."
+      let cmd := s!"writemode on; clearrange {pre} {stop}"
+      let spawn : IO.Process.SpawnArgs :=
+        { cmd := "fdbcli", args := #["--exec", cmd, "--timeout", "30"] }
+      let o ← IO.Process.output spawn
+      if o.exitCode != 0 then throw (IO.userError s!"fdbcli could not clear {pre}: {o.stderr}")
+  | _ => pure ()
   let t1 ← IO.monoMsNow
   return ({ seq, gen := ctx.gen, level := id, target := t, param, outcome, value,
             ms := t1 - t0 }, text)
@@ -411,7 +486,11 @@ def seedLevels : List Level := [
   { id := "crash/rows=400/at=6..21" },
   { id := "crash/rows=2000/at=6..80" },
   { id := "fence/writer" },
-  { id := "fence/reader" }]
+  { id := "fence/reader" },
+  { id := "delta/chain/rows=2000" },
+  { id := "delta/stale/rows=2000" },
+  { id := "delta/fold/rows=2000" },
+  { id := "ycsb/rows=10000/workers=4/batch=1000" }]
 
 def loadLevels (dir : System.FilePath) : IO (List Level) := do
   let path := dir / "levels.tsv"

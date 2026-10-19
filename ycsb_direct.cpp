@@ -20,6 +20,7 @@
 extern "C" {
 int weft_fdb_start(const char *cluster_file);
 void weft_fdb_stop(void);
+int weft_compact_due(sqlite3 *db);
 int weft_vfs_register(int make_default);
 }
 
@@ -86,10 +87,10 @@ struct WorkerResult {
     bool ok = true;
 };
 
+std::string g_prefix = "ycsb";
+
 std::string db_filename_for(unsigned worker_id) {
-    char buf[64];
-    std::snprintf(buf, sizeof buf, "ycsb-%u.db", worker_id);
-    return buf;
+    return g_prefix + "-" + std::to_string(worker_id) + ".db";
 }
 
 sqlite3 *open_db(const std::string &filename, const char *vfs, const Options &opt) {
@@ -273,8 +274,12 @@ void run_worker(unsigned worker_id, std::uint64_t recordcount, std::uint64_t opc
     // Two cycles: the first fold reads only the log, the second a shard and a log.
     if (ok && opt.verify) {
         WorkerResult scratch;
+        // The second cycle folds in the middle and goes on writing on the same handle,
+        // so a delta taken against a base the fold deleted is reached.
         ok = close_and_check(db, filename, opt, worker_id, 1)
              && run_phase(db, seed + 1, recordcount, opcount, batch, scratch)
+             && weft_compact_due(db) == SQLITE_OK
+             && run_phase(db, seed + 2, recordcount, opcount, batch, scratch)
              && close_and_check(db, filename, opt, worker_id, 2);
     }
     out.ok = ok;
@@ -288,7 +293,7 @@ void run_worker(unsigned worker_id, std::uint64_t recordcount, std::uint64_t opc
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: ycsb_direct <recordcount> <opcount> [workers] [batch]"
-                             " [--sorted-load] [--nomutex] [--verify]\n"
+                             " [--sorted-load] [--nomutex] [--verify] [--prefix NAME]\n"
                              "\n"
                              "  YCSB workload F: 50%% READ + 50%% RMW on `usertable`.\n"
                              "  One SQLite database file per worker (roundtable shape).\n");
@@ -304,6 +309,7 @@ int main(int argc, char** argv) {
         if (flag == "--sorted-load") opt.sorted_load = true;
         else if (flag == "--nomutex") opt.nomutex = true;
         else if (flag == "--verify") opt.verify = true;
+        else if (flag == "--prefix" && a + 1 < argc) g_prefix = argv[++a];
         else { std::fprintf(stderr, "unknown flag %s\n", argv[a]); return 2; }
     }
     // Before anything initialises SQLite: no global memory statistics, which cost a mutex
