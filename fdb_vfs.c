@@ -177,6 +177,28 @@ static int plant_torn_commit(void) {
 	return g_plant_torn_commit;
 }
 
+// The page-delta plants, one for each way `spec/PageDelta.lean` shows a writer can break
+// the rule that a delta's base is the full row it names. Each is inert unless its variable
+// is set. CHAIN takes a delta row as a later delta's base, STALE keeps a base's name but not
+// its bytes, FOLD keeps bases across a fold that deleted their rows.
+static int plant_flag(int *cache, const char *name) {
+	if (*cache < 0) {
+		const char *v = getenv(name);
+		*cache = v && *v && strcmp(v, "0") != 0;
+	}
+	return *cache;
+}
+static int g_plant_delta_chain = -1, g_plant_delta_stale = -1, g_plant_delta_fold = -1;
+static int plant_delta_chain(void) {
+	return plant_flag(&g_plant_delta_chain, "WEFT_PLANT_DELTA_CHAIN");
+}
+static int plant_delta_stale(void) {
+	return plant_flag(&g_plant_delta_stale, "WEFT_PLANT_DELTA_STALE");
+}
+static int plant_delta_fold(void) {
+	return plant_flag(&g_plant_delta_fold, "WEFT_PLANT_DELTA_FOLD");
+}
+
 // `WEFT_PLANT_SLOW_COMMIT=1` plants a performance defect: each commit pays one extra read
 // round trip first. The timing attacks run under it to show they can see a slow commit.
 // Inert when the variable is not set.
@@ -385,8 +407,21 @@ static void clear_prefix(FDBTransaction *tr, const char *name, const char *what)
 // One page that SQLite wrote and the store has not taken yet.
 typedef struct {
 	uint32_t pgno;
+	uint8_t as_delta; // the commit sent this page as a delta, set while the commit is built
 	uint8_t bytes[PAGE];
 } DirtyPage;
+
+// The full row a page's next delta is taken against: a log row by txid, or a shard page by
+// its version. `bytes` is that row as stored, so a delta of `bytes` applies to the row.
+#define BASE_TXID 1
+#define BASE_SHARD 2
+#define BASE_SLOTS 4096
+typedef struct {
+	uint32_t pgno;
+	uint8_t kind; // 0 for an empty slot
+	uint64_t id;
+	uint8_t bytes[PAGE];
+} BaseEntry;
 
 typedef struct {
 	sqlite3_file base;
@@ -451,6 +486,10 @@ typedef struct {
 	// bytes older than this connection's own last write.
 	FDBTransaction *ro_tr;
 	uint64_t ro_tr_deadline_us;
+
+	// Bases for page deltas, one slot per page number modulo BASE_SLOTS, allocated by the
+	// first read of a writer. A missing base costs a full page, never a wrong one.
+	BaseEntry *bases;
 } FdbFile;
 
 // A read that reuses a cached FDB transaction across xRead calls on the same
@@ -770,6 +809,138 @@ static fdb_error_t ra_fill(FDBTransaction *tr, FdbFile *f, uint32_t first, uint3
 // thing, so it is only ever this one: a commit, a fold, or a truncate.
 static void ra_reset(FdbFile *f) { f->ra_count = 0; }
 
+// ── Page deltas ───────────────────────────────────────────────────────────────
+//
+// A page is stored as its difference from a full row when under a fifth of it changed.
+// `spec/PageDelta.lean` models the rule: the base of a delta is always a full row, so a
+// read touches at most two rows. A full row is exactly PAGE bytes; a delta is shorter and
+// starts with DELTA_MAGIC, then the base's kind and id, then runs of offset, length and
+// bytes. The base comes from the writer's memory, so a commit adds no read.
+
+#define DELTA_MAGIC 0xD7
+#define DELTA_HDR 10
+#define DELTA_CUT 5
+#define DELTA_GAP 8
+
+static int is_delta(const uint8_t *val, int vlen) {
+	return vlen != PAGE && vlen >= DELTA_HDR && val[0] == DELTA_MAGIC;
+}
+
+static void put_be16(uint8_t *p, uint32_t v) {
+	p[0] = (uint8_t)(v >> 8);
+	p[1] = (uint8_t)v;
+}
+
+static uint32_t get_be16(const uint8_t *p) { return ((uint32_t)p[0] << 8) | p[1]; }
+
+// The delta of `page` against `base`, or 0 when it would not be under the cut.
+static int delta_encode(const uint8_t *base, const uint8_t *page, int kind, uint64_t id,
+                        uint8_t *out) {
+	const int limit = PAGE / DELTA_CUT;
+	int n = DELTA_HDR;
+	out[0] = DELTA_MAGIC;
+	out[1] = (uint8_t)kind;
+	for (int s = 0; s < 8; s++) out[2 + s] = (uint8_t)(id >> (56 - 8 * s));
+	for (int i = 0; i < PAGE;) {
+		if (base[i] == page[i]) {
+			i++;
+			continue;
+		}
+		int end = i + 1, same = 0;
+		for (int j = i + 1; j < PAGE && same < DELTA_GAP; j++) {
+			if (base[j] == page[j]) {
+				same++;
+			} else {
+				same = 0;
+				end = j + 1;
+			}
+		}
+		const int len = end - i;
+		if (n + 4 + len > limit) return 0;
+		put_be16(out + n, (uint32_t)i);
+		put_be16(out + n + 2, (uint32_t)len);
+		memcpy(out + n + 4, page + i, (size_t)len);
+		n += 4 + len;
+		i = end;
+	}
+	return n;
+}
+
+static uint64_t delta_base_id(const uint8_t *val) {
+	uint64_t id = 0;
+	for (int s = 0; s < 8; s++) id = (id << 8) | val[2 + s];
+	return id;
+}
+
+// Apply a delta to `page`, which holds its base. Returns 0, or -1 for a malformed delta.
+static int delta_apply(const uint8_t *val, int vlen, uint8_t *page) {
+	int n = DELTA_HDR;
+	while (n < vlen) {
+		if (n + 4 > vlen) return -1;
+		const uint32_t off = get_be16(val + n), len = get_be16(val + n + 2);
+		if (off + len > PAGE || n + 4 + (int)len > vlen) return -1;
+		memcpy(page + off, val + n + 4, len);
+		n += 4 + (int)len;
+	}
+	return 0;
+}
+
+static int base_key(uint8_t *key, FdbFile *f, int kind, uint64_t id, uint32_t pgno) {
+	if (kind == BASE_TXID) return key_delta(key, f->name, id, pgno);
+	if (kind == BASE_SHARD) return key_shard(key, f->name, id, pgno);
+	return -1;
+}
+
+static BaseEntry *base_get(FdbFile *f, uint32_t pgno) {
+	if (!f->bases) return NULL;
+	BaseEntry *e = &f->bases[pgno % BASE_SLOTS];
+	return e->kind && e->pgno == pgno ? e : NULL;
+}
+
+static void base_put(FdbFile *f, uint32_t pgno, int kind, uint64_t id, const uint8_t *bytes) {
+	if (f->readonly) return;
+	if (!f->bases) {
+		f->bases = calloc(BASE_SLOTS, sizeof(BaseEntry));
+		if (!f->bases) return;
+	}
+	BaseEntry *e = &f->bases[pgno % BASE_SLOTS];
+	e->pgno = pgno;
+	e->kind = (uint8_t)kind;
+	e->id = id;
+	memcpy(e->bytes, bytes, PAGE);
+}
+
+static void base_clear(FdbFile *f) {
+	if (f->bases) memset(f->bases, 0, (size_t)BASE_SLOTS * sizeof(BaseEntry));
+}
+
+// Finish a row read into `out`: a full row is the page and becomes the page's base; a
+// delta reads its base, which must be full, and applies to it.
+static fdb_error_t finish_row(FDBTransaction *tr, FdbFile *f, uint32_t pgno, int kind,
+                              uint64_t id, uint8_t *out, int *len) {
+	if (!is_delta(out, *len)) {
+		if (*len == PAGE) base_put(f, pgno, kind, id, out);
+		return 0;
+	}
+	uint8_t d[PAGE];
+	const int dlen = *len;
+	memcpy(d, out, (size_t)dlen);
+	uint8_t key[KEYMAX];
+	const int bkind = d[1];
+	const uint64_t bid = delta_base_id(d);
+	const int klen = base_key(key, f, bkind, bid, pgno);
+	if (klen < 0) return 2000; // FoundationDB client_invalid_operation: not retryable
+	int blen = 0, have = 0;
+	memset(out, 0, PAGE);
+	fdb_error_t err = get_bytes(tr, key, klen, out, PAGE, &blen, &have);
+	if (err) return err;
+	if (!have || blen != PAGE) return 2000;
+	base_put(f, pgno, bkind, bid, out);
+	if (delta_apply(d, dlen, out) != 0) return 2000;
+	*len = PAGE;
+	return 0;
+}
+
 // Read one page from the store. `present` stays 0 when no commit and no shard holds it,
 // and the caller then zero-fills.
 //
@@ -788,13 +959,20 @@ static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno
 	*present = 0;
 	*len = 0;
 
-	if (ra_hit(f, pgno, out, len, present)) return 0;
+	// A window holds shard pages only, so a hit is a full shard row.
+	if (ra_hit(f, pgno, out, len, present)) {
+		if (*present) base_put(f, pgno, BASE_SHARD, f->shard_as_of, out);
+		return 0;
+	}
 
 	const uint32_t depth = ra_depth(f, pgno);
 	if (depth) {
 		fdb_error_t pre = ra_fill(tr, f, pgno, depth);
 		if (pre) return pre;
-		if (ra_hit(f, pgno, out, len, present)) return 0;
+		if (ra_hit(f, pgno, out, len, present)) {
+			if (*present) base_put(f, pgno, BASE_SHARD, f->shard_as_of, out);
+			return 0;
+		}
 	}
 
 	const int pidx_klen = key_pidx(pidx_key, f->name, pgno);
@@ -838,11 +1016,12 @@ static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno
 				if (have) {
 					int n = vlen > PAGE ? PAGE : vlen;
 					memcpy(out, val, (size_t)n);
-					if (len) *len = n;
+					*len = n;
 				}
 			}
 		}
 		fdb_future_destroy(spec_f);
+		if (!err && *present) err = finish_row(tr, f, pgno, BASE_TXID, owner, out, len);
 		return err;
 	}
 
@@ -850,11 +1029,15 @@ static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno
 
 	if (got) {
 		int klen = key_delta(data_key, f->name, owner, pgno);
-		return get_bytes(tr, data_key, klen, out, PAGE, len, present);
+		err = get_bytes(tr, data_key, klen, out, PAGE, len, present);
+		if (!err && *present) err = finish_row(tr, f, pgno, BASE_TXID, owner, out, len);
+		return err;
 	}
 	if (f->has_shard) {
 		int klen = key_shard(data_key, f->name, f->shard_as_of, pgno);
-		return get_bytes(tr, data_key, klen, out, PAGE, len, present);
+		err = get_bytes(tr, data_key, klen, out, PAGE, len, present);
+		if (!err && *present && *len == PAGE) base_put(f, pgno, BASE_SHARD, f->shard_as_of, out);
+		return err;
 	}
 	return 0;
 }
@@ -1250,10 +1433,15 @@ static fdb_error_t check_view(FDBTransaction *tr, FdbFile *f, int *final) {
 
 // The pages of the commit, under a txid no read can reach yet.
 static void put_delta_pages(FDBTransaction *tr, struct flush_ctx *c) {
-	uint8_t key[KEYMAX];
+	uint8_t key[KEYMAX], d[PAGE];
 	for (int i = c->lo; i < c->hi; i++) {
-		int klen = key_delta(key, c->f->name, c->txid, c->f->dirty[i]->pgno);
-		fdb_transaction_set(tr, key, klen, c->f->dirty[i]->bytes, PAGE);
+		DirtyPage *p = c->f->dirty[i];
+		int klen = key_delta(key, c->f->name, c->txid, p->pgno);
+		BaseEntry *b = base_get(c->f, p->pgno);
+		int n = b ? delta_encode(b->bytes, p->bytes, b->kind, b->id, d) : 0;
+		p->as_delta = n > 0;
+		if (n > 0) fdb_transaction_set(tr, key, klen, d, n);
+		else fdb_transaction_set(tr, key, klen, p->bytes, PAGE);
 	}
 }
 
@@ -1413,6 +1601,17 @@ static int flush(FdbFile *f) {
 	f->head = c.txid;
 	f->sent_size = f->size;
 	f->log_pages += (uint64_t)f->ndirty;
+	// A page sent whole is now its own base. A page sent as a delta keeps the base it was
+	// taken against, which is still a full row, so the next delta stays one link deep.
+	for (int i = 0; i < f->ndirty; i++) {
+		DirtyPage *p = f->dirty[i];
+		if (!p->as_delta || plant_delta_chain()) {
+			base_put(f, p->pgno, BASE_TXID, c.txid, p->bytes);
+		} else if (plant_delta_stale()) {
+			BaseEntry *b = base_get(f, p->pgno);
+			if (b) memcpy(b->bytes, p->bytes, PAGE);
+		}
+	}
 	clear_dirty(f);
 	ra_reset(f); // those pages are not what the window holds any more
 	if (f->ro_tr) {
@@ -1543,6 +1742,10 @@ static fdb_error_t fold_read_body(FDBTransaction *tr, void *ctx, int *final) {
 		int klen = key_delta(key, f->name, c->owner[i], c->lo + i);
 		fu[i] = fdb_transaction_get(tr, key, klen, 0);
 	}
+	// A logged page that is a delta needs its base, which is a second wave in flight.
+	uint8_t **d = calloc(n, sizeof(uint8_t *));
+	int *dlen = calloc(n, sizeof(int));
+	if (!d || !dlen) err = 2000;
 	for (uint32_t i = 0; i < n; i++) {
 		if (!fu[i]) continue;
 		fdb_error_t e = await(fu[i]);
@@ -1550,13 +1753,49 @@ static fdb_error_t fold_read_body(FDBTransaction *tr, void *ctx, int *final) {
 		const uint8_t *val;
 		int vlen;
 		if (!e) e = fdb_future_get_value(fu[i], &have, &val, &vlen);
-		if (!e && have) {
+		if (!e && have && d && is_delta(val, vlen)) {
+			d[i] = malloc((size_t)vlen);
+			if (d[i]) {
+				memcpy(d[i], val, (size_t)vlen);
+				dlen[i] = vlen;
+			} else if (!err) {
+				err = 2000;
+			}
+		} else if (!e && have) {
 			memcpy(c->pages + (size_t)i * PAGE, val, (size_t)(vlen > PAGE ? PAGE : vlen));
 			c->present[i] = 1;
 		}
 		if (e && !err) err = e;
 		fdb_future_destroy(fu[i]);
+		fu[i] = NULL;
 	}
+	for (uint32_t i = 0; i < n && !err; i++) {
+		if (!d || !d[i]) continue;
+		uint8_t key[KEYMAX];
+		int klen = base_key(key, f, d[i][1], delta_base_id(d[i]), c->lo + i);
+		if (klen < 0) err = 2000;
+		else fu[i] = fdb_transaction_get(tr, key, klen, 0);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (!fu[i]) continue;
+		fdb_error_t e = await(fu[i]);
+		fdb_bool_t have = 0;
+		const uint8_t *val;
+		int vlen;
+		if (!e) e = fdb_future_get_value(fu[i], &have, &val, &vlen);
+		uint8_t *slot = c->pages + (size_t)i * PAGE;
+		if (!e && (!have || vlen != PAGE)) e = 2000; // a base is a full row
+		if (!e) {
+			memcpy(slot, val, PAGE);
+			if (delta_apply(d[i], dlen[i], slot) != 0) e = 2000;
+			else c->present[i] = 1;
+		}
+		if (e && !err) err = e;
+		fdb_future_destroy(fu[i]);
+	}
+	for (uint32_t i = 0; d && i < n; i++) free(d[i]);
+	free(d);
+	free(dlen);
 	free(fu);
 	return err;
 }
@@ -1734,6 +1973,9 @@ static int compact(FdbFile *f) {
 	f->shard_as_of = as_of;
 	f->base_pages = kept;
 	f->log_pages = 0;
+	// The fold deleted every log row and the old shard, which is every base this handle
+	// knew. The pages read next become the new bases.
+	if (!plant_delta_fold()) base_clear(f);
 	ra_reset(f); // the window points at a shard version that is no longer the one read
 	return SQLITE_OK;
 }
@@ -2410,6 +2652,8 @@ static int fdb_close(sqlite3_file *file) {
 		fdb_transaction_destroy(f->ro_tr);
 		f->ro_tr = NULL;
 	}
+	free(f->bases);
+	f->bases = NULL;
 	free(f->ra_window);
 	free(f->ra_state);
 	f->ra_window = NULL;
