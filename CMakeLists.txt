@@ -82,7 +82,12 @@ add_executable(bench_vfs EXCLUDE_FROM_ALL bench_vfs.c)
 target_link_libraries(bench_vfs PRIVATE weft_fdb_vfs)
 add_executable(tpcc EXCLUDE_FROM_ALL tpcc.c)
 target_link_libraries(tpcc PRIVATE weft_fdb_vfs Threads::Threads m)
-add_dependencies(benchmarks bench_vfs tpcc)
+# `game_load` holds a constant game-shaped load, players on a tick and bulk work on a
+# schedule, and reports the players' commit latency: the number to optimise for VR.
+add_executable(game_load EXCLUDE_FROM_ALL game_load.cpp)
+target_link_libraries(game_load PRIVATE weft_fdb_vfs Threads::Threads)
+target_compile_options(game_load PRIVATE -Wall -Wextra)
+add_dependencies(benchmarks bench_vfs tpcc game_load)
 
 # `sqlrun` is a tool, not a test: it runs whatever SQL arrives on stdin and reports rows and
 # elapsed time. It asserts nothing, so it is out of the default build for the same reason the
