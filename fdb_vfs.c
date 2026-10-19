@@ -1620,42 +1620,111 @@ static fdb_error_t finish_body(FDBTransaction *tr, void *ctx, int *final) {
 	return 0;
 }
 
+// A fold sends a window's shard rows and reads the next window while they commit, with
+// up to FOLD_DEPTH windows' commits in flight. One window at a time spent the read and
+// the commit in turn: of 2.5 s at close for a 35 MB database, 1.4 s was waiting on a
+// commit with nothing else to do. Smaller windows commit faster, since FoundationDB
+// resolves a 10 MB transaction slowly; the depth keeps memory near the old single window.
+#define FOLD_WINDOW_PAGES (STAGE_TXN_PAGES / 4)
+#define FOLD_DEPTH 4
+
+struct fold_slot {
+	struct fold_ctx c;
+	FDBTransaction *tr;
+	FDBFuture *fu; // the window's commit, while it is in flight
+	int sent;      // the window has rows to settle
+};
+
+// Wait for a window's commit. A commit that failed goes again through `run_txn`, which
+// knows which errors may be retried and checks the fence; the rows are the same rows
+// under a shard version no read uses yet, so writing them twice is harmless.
+static int fold_settle(struct fold_slot *s, uint32_t *kept) {
+	if (!s->sent) return SQLITE_OK;
+	int again = 1;
+	if (s->fu) {
+		again = await(s->fu) != 0;
+		fdb_future_destroy(s->fu);
+		s->fu = NULL;
+	}
+	if (s->tr) {
+		fdb_transaction_destroy(s->tr);
+		s->tr = NULL;
+	}
+	s->sent = 0;
+	if (again) {
+		int rc = run_txn(fold_write_body, &s->c, 1, SQLITE_IOERR_WRITE);
+		if (rc != SQLITE_OK) return rc;
+	}
+	for (uint32_t i = 0; i < s->c.hi - s->c.lo; i++)
+		if (s->c.present[i]) (*kept)++;
+	return SQLITE_OK;
+}
+
+// Start a window's commit and return without waiting for it. Anything that stops the
+// commit from starting leaves the window to `fold_settle`, which sends it the slow way.
+static int fold_send(struct fold_slot *s) {
+	s->sent = 1;
+	if (fdb_database_create_transaction(g_db, &s->tr)) {
+		s->tr = NULL;
+		return SQLITE_OK;
+	}
+	int final = 0;
+	fdb_error_t err = fold_write_body(s->tr, &s->c, &final);
+	if (final) return final;
+	if (err) return SQLITE_OK;
+	crash_point();
+	s->fu = fdb_transaction_commit(s->tr);
+	return SQLITE_OK;
+}
+
 static int compact(FdbFile *f) {
 	uint64_t as_of = f->head;
 	uint32_t npages = (uint32_t)((f->size + PAGE - 1) / PAGE);
 	if (npages == 0) return SQLITE_OK;
 
-	// A window is as many pages as one transaction carries, so memory and transaction
-	// size come from the same derived limit.
-	uint32_t window = STAGE_TXN_PAGES;
+	uint32_t window = FOLD_WINDOW_PAGES;
 	if (window > npages) window = npages;
 
-	struct fold_ctx c = {f, as_of, 0, 0, NULL, NULL, NULL};
-	c.pages = malloc((size_t)window * PAGE);
-	c.present = malloc(window);
-	c.owner = malloc((size_t)window * sizeof(uint64_t));
-	if (!c.pages || !c.present || !c.owner) {
-		free(c.pages);
-		free(c.present);
-		free(c.owner);
-		return SQLITE_IOERR_NOMEM;
+	struct fold_slot slot[FOLD_DEPTH];
+	memset(slot, 0, sizeof slot);
+	int rc = SQLITE_OK;
+	for (int i = 0; i < FOLD_DEPTH; i++) {
+		struct fold_ctx *c = &slot[i].c;
+		c->f = f;
+		c->as_of = as_of;
+		c->pages = malloc((size_t)window * PAGE);
+		c->present = malloc(window);
+		c->owner = malloc((size_t)window * sizeof(uint64_t));
+		if (!c->pages || !c->present || !c->owner) rc = SQLITE_IOERR_NOMEM;
 	}
 
 	uint32_t kept = 0;
-	int rc = SQLITE_OK;
-	for (uint32_t lo = 0; lo < npages; lo += window) {
-		c.lo = lo;
-		c.hi = lo + window;
-		if (c.hi > npages) c.hi = npages;
-
-		if ((rc = run_txn(fold_read_body, &c, 0, SQLITE_IOERR_READ)) != SQLITE_OK) break;
-		if ((rc = run_txn(fold_write_body, &c, 1, SQLITE_IOERR_WRITE)) != SQLITE_OK) break;
-		for (uint32_t i = 0; i < c.hi - c.lo; i++)
-			if (c.present[i]) kept++;
+	uint32_t k = 0;
+	for (uint32_t lo = 0; lo < npages && rc == SQLITE_OK; lo += window, k++) {
+		struct fold_slot *s = &slot[k % FOLD_DEPTH];
+		if ((rc = fold_settle(s, &kept)) != SQLITE_OK) break;
+		s->c.lo = lo;
+		s->c.hi = lo + window;
+		if (s->c.hi > npages) s->c.hi = npages;
+		if ((rc = run_txn(fold_read_body, &s->c, 0, SQLITE_IOERR_READ)) != SQLITE_OK) break;
+		rc = fold_send(s);
 	}
-	free(c.pages);
-	free(c.present);
-	free(c.owner);
+	// Every window settles, even after a failure, so no commit is left in flight with
+	// its buffer freed under it.
+	for (int i = 0; i < FOLD_DEPTH; i++) {
+		int r = SQLITE_OK;
+		if (rc == SQLITE_OK) {
+			r = fold_settle(&slot[i], &kept);
+		} else if (slot[i].fu) {
+			await(slot[i].fu);
+			fdb_future_destroy(slot[i].fu);
+		}
+		if (rc != SQLITE_OK && slot[i].tr) fdb_transaction_destroy(slot[i].tr);
+		if (rc == SQLITE_OK) rc = r;
+		free(slot[i].c.pages);
+		free(slot[i].c.present);
+		free(slot[i].c.owner);
+	}
 	if (rc != SQLITE_OK) return rc;
 
 	struct finish_ctx fin = {f, as_of, kept};
