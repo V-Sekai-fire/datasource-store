@@ -58,6 +58,7 @@ struct Options {
     bool sorted_load = false;
     bool nomutex = false;
     bool verify = false;
+    std::string phases;      // where the run writes its phase boundaries, for --player
 };
 
 // Every worker loads, waits here, and only then starts the timed run, so the run's wall
@@ -82,6 +83,7 @@ struct WorkerResult {
     std::vector<std::uint64_t> rmw_lat;
     std::vector<std::uint64_t> commit_lat;
     std::uint64_t close_us = 0;
+    std::uint64_t close_start_us = 0;
     std::uint64_t run_start_us = 0;
     std::uint64_t run_end_us = 0;
     bool ok = true;
@@ -284,8 +286,62 @@ void run_worker(unsigned worker_id, std::uint64_t recordcount, std::uint64_t opc
     }
     out.ok = ok;
     const std::uint64_t c = now_us();
+    out.close_start_us = c;
     if (db) sqlite3_close(db);
     out.close_us = now_us() - c;
+}
+
+// A player: one row updated and committed at a time, on a database of its own, in a process
+// of its own, until `until` exists. Each sample is a commit a player would wait on. When it
+// stops it reads the phase boundaries the benchmark wrote and reports each phase apart,
+// since the close is where the benchmark's folds run. Both processes read the same
+// monotonic clock.
+int run_player(const std::string &until, const std::string &phases, const Options &opt) {
+    const std::string filename = g_prefix + "-player.db";
+    sqlite3 *db = open_db(filename, kVfsName, opt);
+    if (!db) return 1;
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS p(k INTEGER PRIMARY KEY, v BLOB);"
+                     "BEGIN; WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c"
+                     " WHERE i<1000) INSERT OR IGNORE INTO p SELECT i, randomblob(100) FROM c;"
+                     " COMMIT;", nullptr, nullptr, nullptr);
+    sqlite3_stmt *st = nullptr;
+    sqlite3_prepare_v2(db, "UPDATE p SET v=randomblob(100) WHERE k=?1", -1, &st, nullptr);
+    std::vector<std::uint64_t> at, lat;
+    std::uint32_t rng = 7;
+    for (;;) {
+        if (FILE *f = std::fopen(until.c_str(), "r")) { std::fclose(f); break; }
+        rng = rng * 1103515245u + 12345u;
+        sqlite3_bind_int(st, 1, 1 + static_cast<int>(rng % 1000u));
+        const std::uint64_t t = now_us();
+        if (sqlite3_step(st) != SQLITE_DONE) {
+            std::fprintf(stderr, "player: %s\n", sqlite3_errmsg(db));
+            return 1;
+        }
+        sqlite3_reset(st);
+        at.push_back(t);
+        lat.push_back(now_us() - t);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    std::uint64_t b[5] = {0, 0, 0, 0, 0};
+    FILE *pf = std::fopen(phases.c_str(), "r");
+    if (!pf || std::fscanf(pf, "%" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
+                           &b[0], &b[1], &b[2], &b[3], &b[4]) != 5) {
+        std::fprintf(stderr, "player: no phases in %s\n", phases.c_str());
+        return 1;
+    }
+    std::fclose(pf);
+    const char *names[4] = {"PLAYER-LOAD", "PLAYER-RUN", "PLAYER-CLOSE", "PLAYER-IDLE"};
+    std::vector<std::uint64_t> part[4];
+    for (std::size_t i = 0; i < at.size(); ++i) {
+        int p = 3;
+        if (at[i] >= b[0] && at[i] < b[1]) p = 0;
+        else if (at[i] >= b[1] && at[i] < b[2]) p = 1;
+        else if (at[i] >= b[3] && at[i] < b[4]) p = 2;
+        part[p].push_back(lat[i]);
+    }
+    for (int p = 0; p < 4; ++p) report(names[p], part[p]);
+    return 0;
 }
 
 } // namespace
@@ -294,6 +350,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: ycsb_direct <recordcount> <opcount> [workers] [batch]"
                              " [--sorted-load] [--nomutex] [--verify] [--prefix NAME]\n"
+                             "  [--phases FILE] [--player UNTIL_FILE]\n"
                              "\n"
                              "  YCSB workload F: 50%% READ + 50%% RMW on `usertable`.\n"
                              "  One SQLite database file per worker (roundtable shape).\n");
@@ -304,12 +361,15 @@ int main(int argc, char** argv) {
     const std::uint32_t workers = (argc > 3) ? (std::uint32_t)std::atoi(argv[3]) : 1u;
     const std::uint64_t batch = (argc > 4) ? std::strtoull(argv[4], nullptr, 10) : 1ULL;
     Options opt;
+    std::string player_until;
     for (int a = 5; a < argc; ++a) {
         const std::string flag = argv[a];
         if (flag == "--sorted-load") opt.sorted_load = true;
         else if (flag == "--nomutex") opt.nomutex = true;
         else if (flag == "--verify") opt.verify = true;
         else if (flag == "--prefix" && a + 1 < argc) g_prefix = argv[++a];
+        else if (flag == "--phases" && a + 1 < argc) opt.phases = argv[++a];
+        else if (flag == "--player" && a + 1 < argc) player_until = argv[++a];
         else { std::fprintf(stderr, "unknown flag %s\n", argv[a]); return 2; }
     }
     // Before anything initialises SQLite: no global memory statistics, which cost a mutex
@@ -321,6 +381,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     weft_vfs_register(0);
+    if (!player_until.empty()) {
+        const int rc = run_player(player_until, opt.phases, opt);
+        weft_fdb_stop();
+        return rc;
+    }
 
     std::printf("== ycsb_direct: workers=%u recordcount=%" PRIu64 " opcount=%" PRIu64
                 " batch=%" PRIu64 " sorted_load=%d nomutex=%d\n",
@@ -341,6 +406,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint64_t> all_read, all_rmw, all_load, all_commit, all_close;
     std::uint64_t total_ops = 0;
     std::uint64_t run_start = UINT64_MAX, run_end = 0;
+    std::uint64_t close_start = UINT64_MAX, close_end = 0;
     for (auto& r : results) {
         if (!r.ok) { weft_fdb_stop(); return 1; }
         run_start = std::min(run_start, r.run_start_us);
@@ -351,6 +417,15 @@ int main(int argc, char** argv) {
         all_load.insert(all_load.end(), r.load_lat.begin(), r.load_lat.end());
         all_commit.insert(all_commit.end(), r.commit_lat.begin(), r.commit_lat.end());
         all_close.push_back(r.close_us);
+        close_start = std::min(close_start, r.close_start_us);
+        close_end = std::max(close_end, r.close_start_us + r.close_us);
+    }
+    if (!opt.phases.empty()) {
+        if (FILE *pf = std::fopen(opt.phases.c_str(), "w")) {
+            std::fprintf(pf, "%" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+                         wall_start, run_start, run_end, close_start, close_end);
+            std::fclose(pf);
+        }
     }
     const double wall_sec = wall_us / 1e6;
     std::printf("[OVERALL] wall_s=%.3f workers=%u throughput=%.1f ops/sec\n",
