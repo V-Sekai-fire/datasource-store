@@ -286,12 +286,30 @@ static fdb_error_t await(FDBFuture *f) {
 // not depend on what an earlier attempt did.
 typedef fdb_error_t (*txn_body)(FDBTransaction *tr, void *ctx, int *final);
 
+// Work nobody is waiting on in real time runs at FoundationDB's batch priority, so a busy
+// cluster admits a player's commit before it. Only a fold sets this. The priority decides
+// when a transaction gets its read version and nothing else: the reads, the conflict check
+// and the commit are the same, so every guarantee stays. A local backend has no queue to
+// order and ignores it. `WEFT_BULK_PRIORITY=default` turns it off, as the control.
+static __thread int t_bulk;
+static int g_bulk_default = -1;
+
+static void bulk_priority(FDBTransaction *tr) {
+	if (!t_bulk) return;
+	if (g_bulk_default < 0) {
+		const char *v = getenv("WEFT_BULK_PRIORITY");
+		g_bulk_default = v && strcmp(v, "default") == 0;
+	}
+	if (!g_bulk_default) fdb_transaction_set_option(tr, FDB_TR_OPTION_PRIORITY_BATCH, NULL, 0);
+}
+
 static int run_txn(txn_body body, void *ctx, int is_write, int ioerr) {
 	FDBTransaction *tr = NULL;
 	if (fdb_database_create_transaction(g_db, &tr)) return ioerr;
 
 	for (;;) {
 		int final = 0;
+		bulk_priority(tr); // again on every attempt, since a retry resets the transaction
 		fdb_error_t err = body(tr, ctx, &final);
 		if (final) {
 			fdb_transaction_destroy(tr);
@@ -1907,6 +1925,7 @@ static int fold_send(struct fold_slot *s) {
 		s->tr = NULL;
 		return SQLITE_OK;
 	}
+	bulk_priority(s->tr);
 	int final = 0;
 	fdb_error_t err = fold_write_body(s->tr, &s->c, &final);
 	if (final) return final;
@@ -1916,7 +1935,16 @@ static int fold_send(struct fold_slot *s) {
 	return SQLITE_OK;
 }
 
+static int compact_at(FdbFile *f);
+
 static int compact(FdbFile *f) {
+	t_bulk = 1;
+	int rc = compact_at(f);
+	t_bulk = 0;
+	return rc;
+}
+
+static int compact_at(FdbFile *f) {
 	uint64_t as_of = f->head;
 	uint32_t npages = (uint32_t)((f->size + PAGE - 1) / PAGE);
 	if (npages == 0) return SQLITE_OK;
