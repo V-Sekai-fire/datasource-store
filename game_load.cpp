@@ -64,9 +64,10 @@ void report(const char *label, std::vector<std::uint64_t> v) {
     for (auto x : v) sum += static_cast<double>(x);
     auto at = [&](double p) { return v[static_cast<std::size_t>(p * (v.size() - 1))]; };
     std::printf("[%s] count=%zu avg_us=%.0f p50=%" PRIu64 " p90=%" PRIu64 " p99=%" PRIu64
-                " p999=%" PRIu64 " max=%" PRIu64 "\n",
+                " p999=%" PRIu64 " p9999=%" PRIu64 " p99999=%" PRIu64 " p999999=%" PRIu64
+                " max=%" PRIu64 "\n",
                 label, v.size(), sum / v.size(), at(0.5), at(0.9), at(0.99), at(0.999),
-                v.back());
+                at(0.9999), at(0.99999), at(0.999999), v.back());
 }
 
 bool exec(sqlite3 *db, const char *sql) {
@@ -113,6 +114,7 @@ struct Config {
     int bulk_rows_per_commit = 2000;
     double bulk_commits_per_s = 2;
     std::string prefix = "game";
+    std::string dump;            // every measured tick's latency, u32 microseconds, appended
 };
 
 std::atomic<bool> g_failed{false};
@@ -214,6 +216,7 @@ int main(int argc, char **argv) {
         else if (f == "--bulk-rows-per-commit") c.bulk_rows_per_commit = std::atoi(next());
         else if (f == "--bulk-commits-per-s") c.bulk_commits_per_s = std::atof(next());
         else if (f == "--prefix") c.prefix = next();
+        else if (f == "--dump") c.dump = next();
         else { std::fprintf(stderr, "unknown flag %s\n", f.c_str()); return 2; }
     }
     if (weft_fdb_start(std::getenv("WEFT_FDB_CLUSTER_FILE"))) {
@@ -249,10 +252,36 @@ int main(int argc, char **argv) {
         all.insert(all.end(), lat[p].begin(), lat[p].end());
         all_late += late[p];
     }
+    if (!c.dump.empty()) {
+        if (FILE *df = std::fopen(c.dump.c_str(), "ab")) {
+            for (auto x : all) {
+                const std::uint32_t u =
+                    x > 0xffffffffu ? 0xffffffffu : static_cast<std::uint32_t>(x);
+                std::fwrite(&u, sizeof u, 1, df);
+            }
+            std::fclose(df);
+        }
+    }
     report("TICK", all);
+    // A day in VR at 20 Hz is 1 728 000 ticks a player, so the percentile that matters is the
+    // one a day reaches: six nines, or simply how many waits a day crossed each line a person
+    // can feel. Counted, and scaled to one player-day.
+    {
+        const std::uint64_t lines[] = {20000, 50000, 100000, 250000, 500000, 1000000};
+        const double days = all.empty() ? 0 : all.size() / (c.hz * 86400.0);
+        std::printf("[HITCH] player_days=%.3f", days);
+        for (auto l : lines) {
+            std::uint64_t n = 0;
+            for (auto x : all) n += x > l;
+            std::printf(" over_%" PRIu64 "ms=%" PRIu64 " (%.1f/day)", l / 1000, n,
+                        days > 0 ? n / days : 0.0);
+        }
+        std::printf("\n");
+    }
     // The p99 of each ten-second window: a load that is constant should give windows that
     // agree, and a window that does not is the run's noise, seen rather than averaged in.
     const std::size_t nwin = static_cast<std::size_t>(c.seconds / 10);
+    if (nwin <= 60) {
     std::vector<std::vector<std::uint64_t>> win(std::max<std::size_t>(nwin, 1));
     for (int p = 0; p < c.players; ++p)
         for (std::size_t i = 0; i < lat[p].size(); ++i)
@@ -265,6 +294,7 @@ int main(int argc, char **argv) {
         std::printf(" %" PRIu64, w.empty() ? 0 : w[at]);
     }
     std::printf("\n");
+    }
     std::printf("[LATE] ticks=%zu late=%" PRIu64 " share=%.4f\n", all.size(), all_late,
                 all.empty() ? 0.0 : static_cast<double>(all_late) / all.size());
     if (c.bulk_rows > 0) {

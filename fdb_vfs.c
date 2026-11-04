@@ -90,6 +90,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 // SQLite's page size. This is not a choice.
@@ -1866,6 +1867,16 @@ static fdb_error_t finish_body(FDBTransaction *tr, void *ctx, int *final) {
 // resolves a 10 MB transaction slowly; the depth keeps memory near the old single window.
 #define FOLD_WINDOW_PAGES (STAGE_TXN_PAGES / 4)
 #define FOLD_DEPTH 4
+#define FOLD_DEPTH_MAX 8
+
+// Experiment knobs, read once: WEFT_FOLD_DEPTH (1..8), WEFT_FOLD_WINDOW (pages),
+// WEFT_FOLD_GAP_US (a pause between windows). Unset, the fold is what it was.
+static long fold_knob(const char *name, long dflt, long lo, long hi) {
+	const char *s = getenv(name);
+	if (!s || !*s) return dflt;
+	long x = atol(s);
+	return x < lo ? lo : x > hi ? hi : x;
+}
 
 struct fold_slot {
 	struct fold_ctx c;
@@ -1921,13 +1932,16 @@ static int compact(FdbFile *f) {
 	uint32_t npages = (uint32_t)((f->size + PAGE - 1) / PAGE);
 	if (npages == 0) return SQLITE_OK;
 
-	uint32_t window = FOLD_WINDOW_PAGES;
+	const int depth = (int)fold_knob("WEFT_FOLD_DEPTH", FOLD_DEPTH, 1, FOLD_DEPTH_MAX);
+	const long gap_us = fold_knob("WEFT_FOLD_GAP_US", 0, 0, 1000000);
+	uint32_t window = (uint32_t)fold_knob("WEFT_FOLD_WINDOW", FOLD_WINDOW_PAGES, 1,
+	                                      FOLD_WINDOW_PAGES);
 	if (window > npages) window = npages;
 
-	struct fold_slot slot[FOLD_DEPTH];
+	struct fold_slot slot[FOLD_DEPTH_MAX];
 	memset(slot, 0, sizeof slot);
 	int rc = SQLITE_OK;
-	for (int i = 0; i < FOLD_DEPTH; i++) {
+	for (int i = 0; i < depth; i++) {
 		struct fold_ctx *c = &slot[i].c;
 		c->f = f;
 		c->as_of = as_of;
@@ -1940,7 +1954,11 @@ static int compact(FdbFile *f) {
 	uint32_t kept = 0;
 	uint32_t k = 0;
 	for (uint32_t lo = 0; lo < npages && rc == SQLITE_OK; lo += window, k++) {
-		struct fold_slot *s = &slot[k % FOLD_DEPTH];
+		struct fold_slot *s = &slot[k % depth];
+		if (gap_us && k) {
+			struct timespec gap = {gap_us / 1000000, (gap_us % 1000000) * 1000};
+			nanosleep(&gap, NULL);
+		}
 		if ((rc = fold_settle(s, &kept)) != SQLITE_OK) break;
 		s->c.lo = lo;
 		s->c.hi = lo + window;
@@ -1950,7 +1968,7 @@ static int compact(FdbFile *f) {
 	}
 	// Every window settles, even after a failure, so no commit is left in flight with
 	// its buffer freed under it.
-	for (int i = 0; i < FOLD_DEPTH; i++) {
+	for (int i = 0; i < depth; i++) {
 		int r = SQLITE_OK;
 		if (rc == SQLITE_OK) {
 			r = fold_settle(&slot[i], &kept);

@@ -87,7 +87,13 @@ target_link_libraries(tpcc PRIVATE weft_fdb_vfs Threads::Threads m)
 add_executable(game_load EXCLUDE_FROM_ALL game_load.cpp)
 target_link_libraries(game_load PRIVATE weft_fdb_vfs Threads::Threads)
 target_compile_options(game_load PRIVATE -Wall -Wextra)
-add_dependencies(benchmarks bench_vfs tpcc game_load)
+# `fdb_floor` is the same player shape on FoundationDB alone, no SQLite and no store: the
+# floor `game_load` sits on, measured on the same host.
+add_executable(fdb_floor EXCLUDE_FROM_ALL fdb_floor.c)
+target_include_directories(fdb_floor PRIVATE ${FDB_INCLUDE_DIR}/foundationdb)
+target_compile_definitions(fdb_floor PRIVATE FDB_API_VERSION=730)
+target_link_libraries(fdb_floor PRIVATE ${FDB_LIBRARY} Threads::Threads)
+add_dependencies(benchmarks bench_vfs tpcc game_load fdb_floor)
 
 # `sqlrun` is a tool, not a test: it runs whatever SQL arrives on stdin and reports rows and
 # elapsed time. It asserts nothing, so it is out of the default build for the same reason the
