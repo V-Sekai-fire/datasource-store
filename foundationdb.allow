@@ -51,6 +51,14 @@ fdb_transaction_get_range
 fdb_transaction_set
 fdb_transaction_clear_range
 
+# ── Admission priority ────────────────────────────────────────────────────────
+# One option, and only FDB_TR_OPTION_PRIORITY_BATCH, set by `bulk_priority` on a fold's
+# transactions. It decides when a transaction gets its read version under load, and changes
+# nothing a transaction reads or writes, so `Backend.lean`'s laws are untouched and a local
+# backend, with no queue to order, ignores it. The ban below still holds for every option
+# that changes semantics.
+fdb_transaction_set_option
+
 # ── What is deliberately absent ───────────────────────────────────────────────
 #
 # Each of these is a real FoundationDB feature with no SQLite equivalent. Adopting one
@@ -59,7 +67,7 @@ fdb_transaction_clear_range
 # `spec/Backend.lean` stops being provable. That the code uses none of them is why a local
 # backend is possible at all.
 #
-# fdb_transaction_set_option
+# fdb_transaction_set_option, for anything but admission priority
 #     The important one. It is how a caller would turn off read-your-writes, make reads
 #     snapshot by default, or raise the transaction limits. Banning it is what pins the
 #     code to default semantics, which is the claim `Backend.lean` is written against.
