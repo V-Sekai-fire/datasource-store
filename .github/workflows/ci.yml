@@ -82,6 +82,22 @@ jobs:
           CXX: clang++
         run: ./ci.sh keys-witness backup-fresh
 
+  # The Mojo port of the key layout, diffed against the C header and gated by witness-mojo.
+  # Needs pixi and the network for contract-witness-mojo, and neither FoundationDB nor SQLite.
+  mojo-keys:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          manifest-path: mojo/pixi.toml
+          locked: true
+
+      - name: The Mojo key layout
+        run: ./ci.sh mojo-keys
+
   # The parallel-commit protocol against the spec it claims to be. Needs Java and the TLA+
   # tools, and neither FoundationDB nor SQLite: it checks a specification, not a run.
   tla:

@@ -59,7 +59,8 @@ that keeps trailing `0xFF`). Both mutants fail the gate and the parity diff.
 
 ## Not yet verified
 
-- No CI wiring: `ci.sh` and the CMake `keys-witness` target still run the C++ gate.
+- The C++ `keys-witness` stage still runs beside the Mojo one (`./ci.sh mojo-keys`, job `mojo-keys`); neither replaces the other yet.
+- `ci.sh mojo-keys` clones contract-witness-mojo `main` when no sibling checkout exists, so the ladder is not pinned.
 - Shrinking is off for the compound inputs (`no_shrink`), so a failure prints the input as
   drawn, not a minimum.
 - Only macOS arm64 was run. `pixi.toml` lists linux-64 and linux-aarch64 untested.
