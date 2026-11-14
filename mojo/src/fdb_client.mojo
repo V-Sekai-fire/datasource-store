@@ -16,6 +16,10 @@ from std.os import getenv
 
 comptime API_VERSION = 730
 
+# The one transaction option the store sets (`bulk_priority` in `fdb_vfs.c`): admission order
+# under load, with no effect on what a transaction reads or writes.
+comptime TR_OPTION_PRIORITY_BATCH = 201
+
 
 # The libfdb_c that loads: WEFT_FDB_LIB, then the usual install paths.
 def fdb_lib_path() raises -> String:
@@ -70,12 +74,31 @@ def check(lib: OwnedDLHandle, code: Int32, what: String) raises:
         raise Error(what + ": " + String(code) + " " + error_text(lib, code))
 
 
+# What a read answers: a FoundationDB error code (0 for none), and the value when there is one.
+# The code is returned rather than raised so a retry loop can pass it to `on_error`.
+@fieldwise_init
+struct GetResult(Copyable, Movable):
+    var code: Int32
+    var present: Bool
+    var value: List[UInt8]
+
+
+# The first or last key of a range, for `edge_number`: every versioned key in the layout ends
+# with its number, so the newest shard version or the oldest pin is read off the edge.
+@fieldwise_init
+struct EdgeResult(Copyable, Movable):
+    var code: Int32
+    var found: Bool
+    var key: List[UInt8]
+
+
 struct Fdb(Movable):
     var lib: OwnedDLHandle
     var path: String
     var db: Int
     var thread: Int
     var stopped: Bool
+    var owns_network: Bool
 
     # Select the API version, start the network thread, and open the database.
     def __init__(out self, cluster_file: String) raises:
@@ -84,18 +107,28 @@ struct Fdb(Movable):
         self.db = 0
         self.thread = 0
         self.stopped = False
-        check(self.lib, self.lib.call["fdb_select_api_version_impl", Int32](API_VERSION, API_VERSION), "select_api_version")
-        check(self.lib, self.lib.call["fdb_setup_network", Int32](), "setup_network")
+        self.owns_network = False
+        # The API version and the network are set once per process. A second handle finds them
+        # already set (2201 for the version) and shares the first handle's network thread.
+        var vrc = self.lib.call["fdb_select_api_version_impl", Int32](API_VERSION, API_VERSION)
+        if vrc != 0 and vrc != 2201:
+            check(self.lib, vrc, "select_api_version")
+        var nrc = self.lib.call["fdb_setup_network", Int32]()
+        var started = nrc == 0
+        if nrc != 0 and nrc != 2009:  # 2009: the network is set up already, by an earlier handle
+            check(self.lib, nrc, "setup_network")
+        self.owns_network = started
         # The network loop, as the thread's start routine.
-        var sym = self.lib.get_symbol[Int]("fdb_run_network")
-        if not sym:
-            raise Error("fdb_run_network not found")
-        var run = Int(sym.value())
-        var tid = _slot()
-        var rc = external_call["pthread_create", Int32](tid, 0, run, 0)
-        if rc != 0:
-            raise Error("pthread_create failed: " + String(rc))
-        self.thread = _rd(tid)
+        if started:
+            var sym = self.lib.get_symbol[Int]("fdb_run_network")
+            if not sym:
+                raise Error("fdb_run_network not found")
+            var run = Int(sym.value())
+            var tid = _slot()
+            var rc = external_call["pthread_create", Int32](tid, 0, run, 0)
+            if rc != 0:
+                raise Error("pthread_create failed: " + String(rc))
+            self.thread = _rd(tid)
         var cf = cluster_file.copy()
         var dbs = _slot()
         check(self.lib, self.lib.call["fdb_create_database", Int32](cf.unsafe_ptr(), dbs), "create_database")
@@ -106,8 +139,9 @@ struct Fdb(Movable):
             return
         self.stopped = True
         _ = self.lib.call["fdb_database_destroy", Int32](self.db)
-        check(self.lib, self.lib.call["fdb_stop_network", Int32](), "stop_network")
-        _ = external_call["pthread_join", Int32](self.thread, 0)
+        if self.owns_network:
+            check(self.lib, self.lib.call["fdb_stop_network", Int32](), "stop_network")
+            _ = external_call["pthread_join", Int32](self.thread, 0)
 
 
 # One transaction. Futures are blocked on from the calling thread; the network thread does the
@@ -130,26 +164,64 @@ struct Txn(Movable):
             self.tr, Int(begin.unsafe_ptr()), Int32(len(begin)), Int(end.unsafe_ptr()), Int32(len(end))
         )
 
-    # The value at `key`, or None when the key is absent.
-    def get(self, fdb: Fdb, key: List[UInt8]) raises -> Optional[List[UInt8]]:
+    # The value at `key`. The FoundationDB error, if any, is in `code` and is not raised.
+    def get_result(self, fdb: Fdb, key: List[UInt8]) raises -> GetResult:
         var f = fdb.lib.call["fdb_transaction_get", Int](self.tr, Int(key.unsafe_ptr()), Int32(len(key)), Int32(0))
-        check(fdb.lib, fdb.lib.call["fdb_future_block_until_ready", Int32](f), "get wait")
-        check(fdb.lib, fdb.lib.call["fdb_future_get_error", Int32](f), "get")
+        var rc = fdb.lib.call["fdb_future_block_until_ready", Int32](f)
+        if rc == 0:
+            rc = fdb.lib.call["fdb_future_get_error", Int32](f)
+        if rc != 0:
+            _ = fdb.lib.call["fdb_future_destroy", Int32](f)
+            return GetResult(rc, False, List[UInt8]())
         var out = _slot()  # present@0 (int), value pointer@8, length@16 (int)
-        check(fdb.lib, fdb.lib.call["fdb_future_get_value", Int32](f, out, out + 8, out + 16), "get value")
-        var present = _rd32(out)
-        var result: Optional[List[UInt8]]
-        if present == 0:
-            result = None
-        else:
+        rc = fdb.lib.call["fdb_future_get_value", Int32](f, out, out + 8, out + 16)
+        var value = List[UInt8]()
+        var present = False
+        if rc == 0 and _rd32(out) != 0:
+            present = True
             var p = _rd(out, 1)
-            var n = _rd32(out + 16)
-            var v = List[UInt8]()
-            for i in range(n):
-                v.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=p)[unsafe_offset=i])
-            result = v^
+            for i in range(_rd32(out + 16)):
+                value.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=p)[unsafe_offset=i])
         _ = fdb.lib.call["fdb_future_destroy", Int32](f)
-        return result^
+        return GetResult(rc, present, value^)
+
+    # The value at `key`, or None when the key is absent. Raises on a FoundationDB error.
+    def get(self, fdb: Fdb, key: List[UInt8]) raises -> Optional[List[UInt8]]:
+        var r = self.get_result(fdb, key)
+        check(fdb.lib, r.code, "get")
+        if not r.present:
+            return None
+        return r.value.copy()
+
+    # The first (or last) key in [begin, end), the way `edge_number` reads it. The result is
+    # laid out as FDBKeyValue, packed to 4: key pointer at 0, key length at 8.
+    def edge(self, fdb: Fdb, begin: List[UInt8], end: List[UInt8], want_last: Bool) raises -> EdgeResult:
+        var f = fdb.lib.call["fdb_transaction_get_range", Int](
+            self.tr,
+            Int(begin.unsafe_ptr()), Int32(len(begin)), Int32(0), Int32(1),
+            Int(end.unsafe_ptr()), Int32(len(end)), Int32(0), Int32(1),
+            Int32(1), Int32(0), Int32(-2), Int32(1), Int32(0), Int32(1 if want_last else 0),
+        )
+        var rc = fdb.lib.call["fdb_future_block_until_ready", Int32](f)
+        if rc == 0:
+            rc = fdb.lib.call["fdb_future_get_error", Int32](f)
+        var key = List[UInt8]()
+        var found = False
+        if rc == 0:
+            var out = _slot()  # kv pointer@0, count@8 (int), more@16 (int)
+            rc = fdb.lib.call["fdb_future_get_keyvalue_array", Int32](f, out, out + 8, out + 16)
+            if rc == 0 and _rd32(out + 8) > 0:
+                found = True
+                var kv = _rd(out)
+                var kp = _rd(kv)
+                for i in range(_rd32(kv + 8)):
+                    key.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=kp)[unsafe_offset=i])
+        _ = fdb.lib.call["fdb_future_destroy", Int32](f)
+        return EdgeResult(rc, found, key^)
+
+    # Mark this transaction batch priority, as a fold's transactions are. Returns the error code.
+    def priority_batch(self, fdb: Fdb) raises -> Int32:
+        return fdb.lib.call["fdb_transaction_set_option", Int32](self.tr, Int32(TR_OPTION_PRIORITY_BATCH), 0, Int32(0))
 
     # Commit. Returns the error code, 0 for success; the caller decides with `on_error`.
     def commit(self, fdb: Fdb) raises -> Int32:

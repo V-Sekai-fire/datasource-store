@@ -25,21 +25,35 @@ cd /work/mojo
 pixi install --locked 2>&1 | tail -1
 export WEFT_FDB_LIB=/opt/fdb/libfdb_c.so WEFT_FDB_CLUSTER_FILE=/opt/fdb/fdb.cluster
 pixi run fdb-client
+pixi run vfs-fdb
 
-# MUTANTS=1: break the client four ways and require the test to fail each time.
+# MUTANTS=1: break the client and the VFS and require the matching test to fail each time.
 if [ -n "${MUTANTS:-}" ]; then
 	apt-get install -y -qq --no-install-recommends perl >/dev/null
 	cp src/fdb_client.mojo /tmp/fdb_client.orig
+	cp src/vfs_fdb.mojo /tmp/vfs_fdb.orig
 	mutant() {
-		name=$1; shift
+		task=$1; file=$2; name=$3; shift 3
 		cp /tmp/fdb_client.orig src/fdb_client.mojo
+		cp /tmp/vfs_fdb.orig src/vfs_fdb.mojo
 		"$@"
-		if cmp -s /tmp/fdb_client.orig src/fdb_client.mojo; then echo "MUTANT $name: pattern did not apply"; return; fi
-		if pixi run fdb-client >/tmp/mutant.out 2>&1; then echo "MUTANT $name: SURVIVED"; else echo "MUTANT $name: caught ($(grep -c '^FAIL' /tmp/mutant.out) failed checks)"; fi
+		if cmp -s /tmp/fdb_client.orig src/fdb_client.mojo && cmp -s /tmp/vfs_fdb.orig src/vfs_fdb.mojo; then echo "MUTANT $name: pattern did not apply"; return; fi
+		if pixi run $task >/tmp/mutant.out 2>&1; then echo "MUTANT $name: SURVIVED"; else echo "MUTANT $name: caught ($(grep -c '^FAIL' /tmp/mutant.out) failed checks, $(grep -c 'Unhandled exception' /tmp/mutant.out) crash)"; fi
 	}
-	mutant "set drops a byte of the value" sed -i 's/Int32(len(value))/Int32(len(value) - 1)/' src/fdb_client.mojo
-	mutant "clear_range has its ends swapped" sed -i 's/Int(begin.unsafe_ptr()), Int32(len(begin)), Int(end.unsafe_ptr()), Int32(len(end))/Int(end.unsafe_ptr()), Int32(len(end)), Int(begin.unsafe_ptr()), Int32(len(begin))/' src/fdb_client.mojo
-	mutant "get never sees a value" sed -i 's/if present == 0:/if True:/' src/fdb_client.mojo
-	mutant "commit hides its error" perl -0pi -e 's/(fdb_future_get_error", Int32\]\(f\)\n        _ = fdb.lib.call\["fdb_future_destroy", Int32\]\(f\)\n)        return rc\n/$1        return Int32(0)\n/' src/fdb_client.mojo
+	C=src/fdb_client.mojo
+	V=src/vfs_fdb.mojo
+	mutant fdb-client $C "client: set drops a byte of the value" sed -i 's/Int32(len(value))/Int32(len(value) - 1)/' $C
+	mutant fdb-client $C "client: clear_range has its ends swapped" sed -i 's/Int(begin.unsafe_ptr()), Int32(len(begin)), Int(end.unsafe_ptr()), Int32(len(end))/Int(end.unsafe_ptr()), Int32(len(end)), Int(begin.unsafe_ptr()), Int32(len(begin))/' $C
+	mutant fdb-client $C "client: get never sees a value" sed -i 's/if rc == 0 and _rd32(out) != 0:/if False:/' $C
+	mutant fdb-client $C "client: commit hides its error" perl -0pi -e 's/(fdb_future_get_error", Int32\]\(f\)\n        _ = fdb.lib.call\["fdb_future_destroy", Int32\]\(f\)\n)        return rc\n/$1        return Int32(0)\n/' $C
+	mutant fdb-client $C "client: the range read takes the first key, not the last" sed -i 's/Int32(1 if want_last else 0)/Int32(0)/' $C
+	mutant fdb-client $C "client: the batch priority option has the wrong code" sed -i 's/^comptime TR_OPTION_PRIORITY_BATCH = 201/comptime TR_OPTION_PRIORITY_BATCH = 999/' $C
+	mutant vfs-fdb $V "vfs: the fence is never checked" sed -i 's/if not r.present or be64_of(r) != f.fence:/if False:/' $V
+	mutant vfs-fdb $V "vfs: a commit writes no index rows" perl -0pi -e 's/    for i in range\(len\(f.pgnos\)\):\n        t.set\(fdb, key_pidx\(f.name, UInt32\(f.pgnos\[i\]\)\), u64_value\(txid\)\)\n//' $V
+	mutant vfs-fdb $V "vfs: open leaves an unfinished commit behind" sed -i 's/    t.clear_range(fdb, drop_from, key_after(key_prefix(f.name, "DELTA")))//' $V
+	mutant vfs-fdb $V "vfs: open does not raise the fence" sed -i 's/    t.set(fdb, key_meta(f.name, "FENCE"), u64_value(f.fence))//' $V
+	mutant vfs-fdb $V "vfs: HEAD is not advanced" sed -i 's/    t.set(fdb, key_meta(f.name, "HEAD"), u64_value(txid))//' $V
+	mutant vfs-fdb $V "vfs: a read ignores the buffered page" perl -0pi -e 's/        if d:\n            ref src = f.pages/        if False:\n            ref src = f.pages/' $V
 	cp /tmp/fdb_client.orig src/fdb_client.mojo
+	cp /tmp/vfs_fdb.orig src/vfs_fdb.mojo
 fi

@@ -29,7 +29,8 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | 2c | Commit models | `spec/GroupCommit.lean` and the rest | Not started |
 | 3a | SQLite VFS in Mojo, over an in-memory store | `sqlite3_vfs` and `sqlite3_io_methods` of `fdb_vfs.c` | Done. `src/vfs_mem.mojo` |
 | 3b | FoundationDB client binding (network thread, transactions) | `fdb_c.h` use in `fdb_vfs.c` | Done. `src/fdb_client.mojo` |
-| 3c | The two joined: pages in FoundationDB through the Mojo VFS | `fdb_vfs.c` | Not started |
+| 3c-1 | The two joined, first cut: open, read, write, commit, fence, truncate, delete | `fdb_vfs.c` | Done. `src/vfs_fdb.mojo` |
+| 3c-2 | Staged commits, compaction and shard reads, delta writes, read-ahead, cross-database commit, readers that follow the head | `fdb_vfs.c` | Not started |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
 
@@ -118,6 +119,27 @@ the entries; no C shim and no shared library, and it runs under `mojo run`.
   FoundationDB's own error 1515, not a crash.
 - Not covered: the retry loop itself (`run_txn`), the cached read transaction, transaction options,
   and futures that outlive their call. Those come with the VFS in 3c.
+
+## Slice 3c-1: SQLite on a Mojo VFS whose files live in FoundationDB
+
+`src/vfs_fdb.mojo` is `vfs_mem.mojo` with `fdb_vfs.c`'s storage: HEAD, SIZE and LOGN, `PIDX/<pgno>`
+naming the commit that owns a page, `DELTA/<txid>/<pgno>` holding it, a fence raised on open and
+checked in every write, the dirty-page buffer, one-transaction commits, and the retry loop. Page
+numbers start at 0, as in the C (`offset / 4096`), so SQLite's header is `PIDX/0`.
+
+- `pixi run vfs-fdb` (needs a cluster): SQLite creates a table, inserts 1,000 rows, updates and
+  passes `integrity_check`; the test then reads FoundationDB directly to check HEAD, SIZE, the
+  PIDX and DELTA rows and SQLite's header in page 0. A reopen sees the rows; a third open raises
+  the fence and the stale handle's commit is refused with HEAD unmoved; a read-only open takes no
+  fence; a commit staged above HEAD is cleared by the next open.
+- It refuses what it cannot yet do: a database with a shard version (a compaction ran) does not
+  open, a commit above `ONE_TXN_PAGES` fails, and pages are written whole.
+- Runs in CI's `test` job with the client test, and in `tests/fdb_container.sh` against a throwaway
+  server. With `MUTANTS=1` the script breaks the client five ways and the VFS five ways (no fence
+  check, no index rows, an unfinished commit left behind, no fence raise, HEAD not advanced, a read
+  that ignores the buffer) and requires the matching test to fail each time.
+- Not yet compared with the C byte for byte: writing a store with `fdb_vfs.c` and reading it from
+  Mojo, and the reverse, is the next check.
 
 ## Differences from the C header
 
