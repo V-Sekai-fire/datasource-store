@@ -63,7 +63,7 @@ jobs:
           locked: true
 
       - name: The commit stage
-        run: ./ci.sh deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb
+        run: ./ci.sh deps build surface mojo-surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb
 
   backup-fresh:
     runs-on: ubuntu-24.04
