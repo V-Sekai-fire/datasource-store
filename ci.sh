@@ -26,7 +26,7 @@ BUILD=${BUILD:-build}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-keys backup-fresh spec tla'
+ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb mojo-keys backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -319,6 +319,14 @@ stage_vfs_ext() {
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
+# The Mojo FoundationDB client against a live cluster: the network thread, writes, reads, a
+# range clear and a real conflict. Needs pixi and what `deps` checks for; the C library comes
+# from the FoundationDB install, and WEFT_FDB_LIB names another when it is elsewhere.
+stage_mojo_fdb() {
+	command -v pixi >/dev/null 2>&1 || { echo "missing: pixi"; return 1; }
+	cd mojo
+	pixi run fdb-client
+}
 # The Mojo ports: the key layout, the page delta codec, the read-ahead scorer, and the VFS
 # skeleton (SQLite running on a Mojo VFS over an in-memory store). `fdb_keys.h` is pure, which is why it was split out: this needs
 # neither FoundationDB nor SQLite. The real C is compiled as the oracle (the header, and the

@@ -57,8 +57,13 @@ jobs:
 
       # `deps` fails rather than skips when FoundationDB is absent, so a broken install
       # above stops here instead of turning the rest of the run into silent passes.
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          manifest-path: mojo/pixi.toml
+          locked: true
+
       - name: The commit stage
-        run: ./ci.sh deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext
+        run: ./ci.sh deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb
 
   backup-fresh:
     runs-on: ubuntu-24.04

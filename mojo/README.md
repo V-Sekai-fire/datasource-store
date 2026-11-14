@@ -28,7 +28,7 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | 2b | Read-ahead scorer, compaction trigger | `ra_depth`, `should_compact` in `fdb_vfs.c` | Done. `src/read_ahead.mojo` |
 | 2c | Commit models | `spec/GroupCommit.lean` and the rest | Not started |
 | 3a | SQLite VFS in Mojo, over an in-memory store | `sqlite3_vfs` and `sqlite3_io_methods` of `fdb_vfs.c` | Done. `src/vfs_mem.mojo` |
-| 3b | FoundationDB client binding (network thread, transactions) | `fdb_c.h` use in `fdb_vfs.c` | Not started |
+| 3b | FoundationDB client binding (network thread, transactions) | `fdb_c.h` use in `fdb_vfs.c` | Done. `src/fdb_client.mojo` |
 | 3c | The two joined: pages in FoundationDB through the Mojo VFS | `fdb_vfs.c` | Not started |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
@@ -95,6 +95,29 @@ the entries; no C shim and no shared library, and it runs under `mojo run`.
   keeping the file, no short-read error, and open ignoring CREATE.
 - Not covered yet: locking (all no-ops, as in `fdb_vfs.c`), `xFileControl`, the dirty-page buffer,
   and everything that makes the store FoundationDB: the fence, the log, the fold.
+
+## Slice 3b: a FoundationDB client in Mojo
+
+`src/fdb_client.mojo` loads `libfdb_c`, selects API 730, starts the network loop on a thread
+(`fdb_run_network` is handed to `pthread_create` as the start routine), and wraps what
+`fdb_vfs.c` uses: get, set, clear_range, commit, and the retry decision. Nothing else.
+
+- `pixi run fdb-client` needs a live cluster (`WEFT_FDB_CLUSTER_FILE`, and `WEFT_FDB_LIB` when
+  `libfdb_c` is not in the usual place). It writes three page rows under the real key layout, reads
+  them back, clears a range and checks the end is exclusive, reads a key never written, and makes
+  a real read-write conflict: commit A reads a key B then overwrites, and A's commit fails with
+  1020 and FoundationDB says it may be retried.
+- CI runs it in the `test` job, which has a FoundationDB.
+- Without a server of your own, `tests/fdb_container.sh` runs the whole thing in a Linux container
+  with a throwaway server: `podman run --rm -v "$PWD":/src:ro docker.io/library/debian:bookworm-slim
+  sh /src/mojo/tests/fdb_container.sh`. With `-e MUTANTS=1` it also breaks the client four ways (a
+  short value, swapped range ends, a get that never sees a value, a commit that hides its error)
+  and requires the test to fail each time. All four are caught.
+- On macOS, `fdbserver` could not start from an agent terminal (`Could not open shared memory`),
+  which is why the container exists. Against a missing cluster file the client fails with
+  FoundationDB's own error 1515, not a crash.
+- Not covered: the retry loop itself (`run_txn`), the cached read transaction, transaction options,
+  and futures that outlive their call. Those come with the VFS in 3c.
 
 ## Differences from the C header
 
