@@ -44,7 +44,17 @@ def delta_encode(
         out.append(UInt8((id >> UInt64(56 - 8 * s)) & 0xFF))
     var n = DELTA_HDR
     var i = 0
+    var bp = base.unsafe_ptr()
+    var pp = page.unsafe_ptr()
     while i < PAGE:
+        # Skip equal bytes. Whole 64-byte blocks first: most of a page is usually unchanged, and
+        # a page is 64 blocks exactly, so a block never reads past the end.
+        if i % 64 == 0:
+            var a = bp.unsafe_load[width=64](i)
+            var b = pp.unsafe_load[width=64](i)
+            if a.eq(b).reduce_and():
+                i += 64
+                continue
         if base[i] == page[i]:
             i += 1
             continue

@@ -30,7 +30,8 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | 3a | SQLite VFS in Mojo, over an in-memory store | `sqlite3_vfs` and `sqlite3_io_methods` of `fdb_vfs.c` | Done. `src/vfs_mem.mojo` |
 | 3b | FoundationDB client binding (network thread, transactions) | `fdb_c.h` use in `fdb_vfs.c` | Done. `src/fdb_client.mojo` |
 | 3c-1 | The two joined, first cut: open, read, write, commit, fence, truncate, delete | `fdb_vfs.c` | Done. `src/vfs_fdb.mojo` |
-| 3c-2 | Staged commits, compaction and shard reads, delta writes, read-ahead, cross-database commit, readers that follow the head | `fdb_vfs.c` | Not started |
+| 3c-2 | Shard reads, delta writes, and the fold at close | `fdb_vfs.c` | Done. Same bytes as the C: `tests/cross.sh` |
+| 3c-3 | Staged commits above one transaction, read-ahead, a pipelined fold, cross-database commit, readers that follow the head | `fdb_vfs.c` | Not started |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
 
@@ -132,8 +133,8 @@ numbers start at 0, as in the C (`offset / 4096`), so SQLite's header is `PIDX/0
   PIDX and DELTA rows and SQLite's header in page 0. A reopen sees the rows; a third open raises
   the fence and the stale handle's commit is refused with HEAD unmoved; a read-only open takes no
   fence; a commit staged above HEAD is cleared by the next open.
-- It refuses what it cannot yet do: a database with a shard version (a compaction ran) does not
-  open, a commit above `ONE_TXN_PAGES` fails, and pages are written whole.
+- It refuses what it cannot yet do: a commit above `ONE_TXN_PAGES` fails. A store the C folded
+  opens (slice 3c-2), pages with a base row go as deltas, and the file folds at close.
 - Runs in CI's `test` job with the client test, and in `tests/fdb_container.sh` against a throwaway
   server. With `MUTANTS=1` the script breaks the client five ways and the VFS five ways (no fence
   check, no index rows, an unfinished commit left behind, no fence raise, HEAD not advanced, a read
@@ -163,3 +164,25 @@ numbers start at 0, as in the C (`offset / 4096`), so SQLite's header is `PIDX/0
 - Shrinking is off for the compound inputs (`no_shrink`), so a failure prints the input as
   drawn, not a minimum.
 - Only macOS arm64 was run. `pixi.toml` lists linux-64 and linux-aarch64 untested.
+
+## Slice 3c-2: the same bytes as the C
+
+`tests/cross.sh` (run by `CROSS=1 sh tests/fdb_container.sh`) runs one SQL workload through the C VFS
+and then through the Mojo VFS, each from an empty store, and compares every key and value
+`fdbcli` can read: the fence, the commit ids, the shard pages, the delta rows and their bases. The
+workload is four sessions: create and fill (a fold at close), a small update, more rows and a
+delete (a second fold), and a last small update left as PIDX and DELTA rows. Both sides use one
+SQLite library, because SQLite writes its version number into page 0. The step failed before the
+fold was ported (20 rows against 9), so it can fail. The same script reads in both directions:
+Mojo reads a store the C wrote and folded, with deltas against its shard, and the C reads what
+Mojo wrote.
+
+The fold here waits on each window, where the C keeps four windows' commits in flight. The bytes
+are the same; the time is not.
+
+## Benchmark
+
+`bench/` runs the $12-server challenge's operations on plain SQLite, the C VFS and the Mojo VFS
+(`BENCH=1 sh tests/fdb_container.sh`). Measured in the container on one single-node in-memory
+FoundationDB: single commits are equal, batched writes are 93 to 98 percent of the C's, and a
+feed read after the writes is about 75 percent of it, for a reason not found yet.
