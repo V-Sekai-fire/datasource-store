@@ -32,18 +32,8 @@ CompileFlags:
     - -I/usr/include/foundationdb
     - -DFDB_API_VERSION=730
 ---
-# The C flags above must not reach the property tests, which are C++. `keys-witness/` has
-# its own build and its own standard, and -std=c11 on a .cc file is an error rather than a
-# guess.
 If:
   PathMatch: .*\.(c|h)
 CompileFlags:
   Add:
     - -std=c11
----
-If:
-  PathMatch: keys-witness/.*\.cc
-CompileFlags:
-  Add:
-    - -std=c++17
-    - -I.

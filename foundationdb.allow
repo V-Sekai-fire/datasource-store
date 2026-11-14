@@ -98,7 +98,7 @@ fdb_transaction_set_option
 # fdb_transaction_get_estimated_range_size_bytes, tenants, the directory and tuple layers
 #     Unused. Conflict detection is implicit from serializable gets, which is what makes
 #     `check_fence` a fence. The tuple layer is not used because `fdb_keys.h` is: a hand
-#     rolled order preserving encoding that `fuzz/keys_test.cc` can test without linking
+#     rolled order preserving encoding that `mojo/tests/keys_witness.mojo` can test without linking
 #     FoundationDB at all.
 #
 # ── One thing a symbol list cannot catch ──────────────────────────────────────
