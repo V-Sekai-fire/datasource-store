@@ -35,3 +35,15 @@ cc -std=c11 -Wall -Wextra -Wno-unused-function -o build/oracle_delta tests/oracl
 ./build/oracle_delta > build/oracle_delta.txt
 mojo run -I src tests/dump_delta.mojo > build/mojo_delta.txt
 compare delta
+
+# The read-ahead scorer and the compaction trigger are static too, and take an FdbFile. The
+# oracle declares just the fields they read.
+awk '/^#define RA_GAP/ {p = 1} /^\/\/ Is this page already in the window/ {p = 0} p' ../fdb_vfs.c > build/readahead_extract.h
+awk '/^static int should_compact\(FdbFile \*f\) \{/ {p = 1} p {print} p && /^}/ {p = 0}' ../fdb_vfs.c >> build/readahead_extract.h
+for sym in ra_depth should_compact RA_FULL RA_DECAY_RANDOM; do
+	grep -q "$sym" build/readahead_extract.h || { echo "read-ahead block lost $sym"; exit 1; }
+done
+cc -std=c11 -Wall -Wextra -Wno-unused-macros -o build/oracle_readahead tests/oracle_readahead.c
+./build/oracle_readahead > build/oracle_readahead.txt
+mojo run -I src tests/dump_readahead.mojo > build/mojo_readahead.txt
+compare readahead
