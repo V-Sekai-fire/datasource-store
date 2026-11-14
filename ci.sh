@@ -26,7 +26,7 @@ BUILD=${BUILD:-build}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface mojo-surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb mojo-keys backup-fresh spec tla'
+ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -117,13 +117,6 @@ stage_build() {
 # serializable. Needs no cluster: it reads the built library's undefined symbols.
 stage_surface() {
 	./check_surface.sh "$BUILD"
-}
-
-# The Mojo side of the same question: the exported entry points against `mojo/vfs_fdb.sigs`.
-# Reads the source, so it needs no build and no Mojo toolchain. The self-test runs first so a
-# gate that cannot fail does not pass quietly.
-stage_mojo_surface() {
-	./check_mojo_surface.sh --self-test && ./check_mojo_surface.sh
 }
 
 # A handoff copies nothing. The reader is a different process with no local file, so this
@@ -326,46 +319,6 @@ stage_vfs_ext() {
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
-# The Mojo FoundationDB client and the Mojo VFS against a live cluster: the network thread,
-# writes, reads, a range clear, a real conflict, then SQLite on the VFS with the fence refusing
-# a second writer. Needs pixi and what `deps` checks for; the C library comes
-# from the FoundationDB install, and WEFT_FDB_LIB names another when it is elsewhere.
-stage_mojo_fdb() {
-	command -v pixi >/dev/null 2>&1 || { echo "missing: pixi"; return 1; }
-	cd mojo
-	pixi run fdb-client
-	pixi run vfs-fdb
-}
-# The Mojo ports: the key layout, the page delta codec, the read-ahead scorer, and the VFS
-# skeleton (SQLite running on a Mojo VFS over an in-memory store). `fdb_keys.h` is pure, which is why it was split out: this needs
-# neither FoundationDB nor SQLite. The real C is compiled as the oracle (the header, and the
-# blocks cut out of fdb_vfs.c) and diffed against the Mojo port, then the
-# contract-witness-mojo gates run their properties and paired planted-false controls. The ladder is cloned at WITNESS_MOJO_REV, so a change
-# upstream cannot break this stage; WITNESS_MOJO names a checkout to use instead (a
-# developer's sibling clone), and it is then the caller's to keep at a known commit.
-WITNESS_MOJO_REV=${WITNESS_MOJO_REV:-f7a97a92520d89d52eb4d48570d644da88d47a4f}
-stage_mojo_keys() {
-	command -v pixi >/dev/null 2>&1 || { echo "missing: pixi"; return 1; }
-	wm=${WITNESS_MOJO:-}
-	if [ -z "$wm" ]; then
-		wm="$here/$BUILD/witness-mojo"
-		if [ ! -d "$wm/.git" ]; then
-			git init -q "$wm"
-			git -C "$wm" remote add origin https://github.com/V-Sekai-fire/contract-witness-mojo.git
-		fi
-		git -C "$wm" fetch -q --depth 1 origin "$WITNESS_MOJO_REV"
-		git -C "$wm" checkout -q --detach FETCH_HEAD
-	fi
-	[ -f "$wm/src/witness/ladder.mojo" ] || { echo "missing: $wm/src/witness/ladder.mojo"; return 1; }
-	echo "witness ladder: $wm at $(git -C "$wm" rev-parse HEAD 2>/dev/null || echo unknown)"
-	cd mojo
-	mkdir -p build
-	pixi run parity
-	pixi run mojo run -I src -I "$wm/src" tests/keys_witness.mojo
-	pixi run mojo run -I src -I "$wm/src" tests/delta_witness.mojo
-	pixi run mojo run -I src -I "$wm/src" tests/readahead_witness.mojo
-	pixi run vfs-mem
-}
 # The probe weftspun-fdb's backup checks read, run against its own controls before a machine
 # arms it, so a regression fails here rather than leaving a production check critical.
 stage_backup_fresh() {

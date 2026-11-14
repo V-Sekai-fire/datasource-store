@@ -6,10 +6,8 @@
 # apart with nothing comparing them. A green run here over a checkout nobody can reproduce
 # locally is the failure that arrangement produces.
 #
-# Three jobs, because they need different things. `test` needs a live FoundationDB, since
-# every program it runs is a program about a database. `mojo-keys` needs neither FoundationDB
-# nor SQLite: `fdb_keys.h` is pure, which is why it was split out. `spec` needs Lean and
-# nothing else.
+# Jobs differ in what they need. `test` needs a live FoundationDB, since every program it
+# runs is a program about a database. `spec` needs Lean and nothing else.
 name: ci
 
 on:
@@ -57,13 +55,8 @@ jobs:
 
       # `deps` fails rather than skips when FoundationDB is absent, so a broken install
       # above stops here instead of turning the rest of the run into silent passes.
-      - uses: prefix-dev/setup-pixi@v0.11.3
-        with:
-          manifest-path: mojo/pixi.toml
-          locked: true
-
       - name: The commit stage
-        run: ./ci.sh deps build surface mojo-surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb
+        run: ./ci.sh deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext
 
   backup-fresh:
     runs-on: ubuntu-24.04
@@ -73,22 +66,6 @@ jobs:
 
       - name: The backup probe against its own controls
         run: ./ci.sh backup-fresh
-
-  # The Mojo port of the key layout, diffed against the C header and gated by witness-mojo.
-  # Needs pixi and the network for contract-witness-mojo (pinned in ci.sh), and neither FoundationDB nor SQLite.
-  mojo-keys:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: prefix-dev/setup-pixi@v0.11.3
-        with:
-          manifest-path: mojo/pixi.toml
-          locked: true
-
-      - name: The Mojo key layout
-        run: ./ci.sh mojo-keys
 
   # The parallel-commit protocol against the spec it claims to be. Needs Java and the TLA+
   # tools, and neither FoundationDB nor SQLite: it checks a specification, not a run.
