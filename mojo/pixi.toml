@@ -12,5 +12,6 @@ mojo = "==1.1.0"
 # at ../../witness-mojo; a standalone checkout clones it anywhere and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 keys-witness = "mojo run -I src -I ../../witness-mojo/src tests/keys_witness.mojo"
 delta-witness = "mojo run -I src -I ../../witness-mojo/src tests/delta_witness.mojo"
+readahead-witness = "mojo run -I src -I ../../witness-mojo/src tests/readahead_witness.mojo"
 parity = "sh tests/parity.sh"
-test = { depends-on = ["parity", "keys-witness", "delta-witness"] }
+test = { depends-on = ["parity", "keys-witness", "delta-witness", "readahead-witness"] }
