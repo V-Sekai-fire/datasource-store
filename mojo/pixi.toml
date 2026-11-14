@@ -16,5 +16,6 @@ delta-witness = "mojo run -I src -I ../../witness-mojo/src tests/delta_witness.m
 readahead-witness = "mojo run -I src -I ../../witness-mojo/src tests/readahead_witness.mojo"
 vfs-mem = "mojo run -I src tests/vfs_mem_test.mojo"
 fdb-client = "mojo run -I src tests/fdb_client_test.mojo"
+vfs-fdb = "mojo run -I src tests/vfs_fdb_test.mojo"
 parity = "sh tests/parity.sh"
 test = { depends-on = ["parity", "keys-witness", "delta-witness", "readahead-witness", "vfs-mem"] }

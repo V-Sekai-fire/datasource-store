@@ -98,6 +98,43 @@ def main() raises:
     check("and FoundationDB says the conflict may be retried", retry, failed)
     ta.destroy(fdb)
 
+    # edge_number: shard versions written in scrambled order; the last key in the range is the
+    # newest version, the first is the oldest. This is the order the layout depends on.
+    var versions: List[UInt64] = [7, 0x100, 3, 0xFFFFFFFF, 0x100000000, 0x8000000000000000, 1]
+    var ts = Txn(fdb)
+    for v in versions:
+        ts.set(fdb, key_shardn(name, v), bytes_of("n"))
+    check("commit shard versions", ts.commit(fdb) == 0, failed)
+    ts.destroy(fdb)
+    var te = Txn(fdb)
+    var from_k = key_prefix(name, "SHARDN")
+    var to_k = key_after(from_k)
+    var newest = te.edge(fdb, from_k, to_k, True)
+    var oldest = te.edge(fdb, from_k, to_k, False)
+    check("the last SHARDN key is the newest version (2^63)", newest.found and get_be64(newest.key, len(newest.key) - 8) == 0x8000000000000000, failed)
+    check("the first SHARDN key is the oldest version (1)", oldest.found and get_be64(oldest.key, len(oldest.key) - 8) == 1, failed)
+    var below = te.edge(fdb, from_k, key_shardn(name, 0x100), True)
+    check("the newest version below 0x100 is 7", below.found and get_be64(below.key, len(below.key) - 8) == 7, failed)
+    var none = te.edge(fdb, key_shardn(name, 2), key_shardn(name, 3), True)
+    check("an empty range finds nothing", not none.found, failed)
+    te.destroy(fdb)
+    var tc = Txn(fdb)
+    tc.clear_range(fdb, from_k, to_k)
+    check("clear the shard versions", tc.commit(fdb) == 0, failed)
+    tc.destroy(fdb)
+
+    # batch priority, the one option the store sets: it changes when a transaction is admitted,
+    # not what it does
+    var tbp = Txn(fdb)
+    check("batch priority is accepted", tbp.priority_batch(fdb) == 0, failed)
+    tbp.set(fdb, k1, v1)
+    check("a batch-priority transaction commits", tbp.commit(fdb) == 0, failed)
+    tbp.destroy(fdb)
+    var tbr = Txn(fdb)
+    var gb = tbr.get(fdb, k1)
+    check("and its write reads back", Bool(gb) and same(gb.value(), v1), failed)
+    tbr.destroy(fdb)
+
     # leave nothing behind
     var tz = Txn(fdb)
     tz.clear_range(fdb, lo, hi)

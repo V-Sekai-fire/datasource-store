@@ -319,13 +319,15 @@ stage_vfs_ext() {
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
-# The Mojo FoundationDB client against a live cluster: the network thread, writes, reads, a
-# range clear and a real conflict. Needs pixi and what `deps` checks for; the C library comes
+# The Mojo FoundationDB client and the Mojo VFS against a live cluster: the network thread,
+# writes, reads, a range clear, a real conflict, then SQLite on the VFS with the fence refusing
+# a second writer. Needs pixi and what `deps` checks for; the C library comes
 # from the FoundationDB install, and WEFT_FDB_LIB names another when it is elsewhere.
 stage_mojo_fdb() {
 	command -v pixi >/dev/null 2>&1 || { echo "missing: pixi"; return 1; }
 	cd mojo
 	pixi run fdb-client
+	pixi run vfs-fdb
 }
 # The Mojo ports: the key layout, the page delta codec, the read-ahead scorer, and the VFS
 # skeleton (SQLite running on a Mojo VFS over an in-memory store). `fdb_keys.h` is pure, which is why it was split out: this needs
