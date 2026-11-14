@@ -61,6 +61,13 @@ def stored_u64(fdb: Fdb, key: List[UInt8]) raises -> Int:
     return -1
 
 
+def stored_present(fdb: Fdb, key: List[UInt8]) raises -> Bool:
+    var t = Txn(fdb)
+    var r = t.get_result(fdb, key)
+    t.destroy(fdb)
+    return r.present
+
+
 def main() raises:
     var failed = 0
     var cluster = getenv("WEFT_FDB_CLUSTER_FILE")
@@ -150,6 +157,63 @@ def main() raises:
     check("opening drops the unfinished commit's pages", not tq.get_result(obs, key_delta(name, UInt64(th + 1), 77)).present, failed)
     tq.destroy(obs)
     _ = lib.call["sqlite3_close", Int32](db4)
+
+    # The file methods called directly, for the paths SQL does not reach: SQLite keeps its own
+    # page cache under EXCLUSIVE locking, so it never reads a dirty page back through the VFS.
+    var name2 = String("mojo-vfs-direct")
+    var nm2 = name2.copy()
+    var vname = V.copy()
+    var vfs = lib.call["sqlite3_vfs_find", Int](vname.unsafe_ptr())
+    var fobj = alloc[UInt8](24)
+    var fa = Int(fobj)
+    var tclean = Txn(obs)
+    tclean.clear_range(obs, key_meta(name2, ""), key_after(key_meta(name2, "")))
+    check("clear the direct test database", tclean.commit(obs) == 0, failed)
+    tclean.destroy(obs)
+    check("vfs_open", vfs_open(vfs, Int(nm2.unsafe_ptr()), fa, 6, 0) == 0, failed)
+    var off = 2 * PAGE + 50  # inside page 2, not at its start: a partial page
+    var wbuf = alloc[UInt8](100)
+    for i in range(100):
+        wbuf[unsafe_offset=i] = UInt8(i + 1)
+    check("a partial-page write", fdb_write(fa, Int(wbuf), 100, Int64(off)) == 0, failed)
+    var rbuf = alloc[UInt8](100)
+    for i in range(100):
+        rbuf[unsafe_offset=i] = 0xEE
+    check("a read before sync sees the buffered bytes", fdb_read(fa, Int(rbuf), 100, Int64(off)) == 0, failed)
+    var same_bytes = True
+    for i in range(100):
+        same_bytes = same_bytes and rbuf[unsafe_offset=i] == UInt8(i + 1)
+    check("and they are the ones written", same_bytes, failed)
+    check("nothing is in FoundationDB before sync", stored_u64(obs, key_meta(name2, "HEAD")) == -1, failed)
+    check("sync commits", fdb_sync(fa, 0) == 0, failed)
+    check("HEAD is 1", stored_u64(obs, key_meta(name2, "HEAD")) == 1, failed)
+    check("SIZE is the end of the write", stored_u64(obs, key_meta(name2, "SIZE")) == off + 100, failed)
+    # a partial overwrite of a stored page: the store's bytes around it must survive
+    var patch = alloc[UInt8](4)
+    for i in range(4):
+        patch[unsafe_offset=i] = 0xFF
+    check("a partial overwrite of a stored page", fdb_write(fa, Int(patch), 4, Int64(off + 10)) == 0, failed)
+    check("sync commits it", fdb_sync(fa, 0) == 0, failed)
+    for i in range(100):
+        rbuf[unsafe_offset=i] = 0xEE
+    check("read back after the second commit", fdb_read(fa, Int(rbuf), 100, Int64(off)) == 0, failed)
+    var kept = True
+    for i in range(100):
+        var want = UInt8(0xFF) if (i >= 10 and i < 14) else UInt8(i + 1)
+        kept = kept and rbuf[unsafe_offset=i] == want
+    check("the patch landed and the bytes around it survived", kept, failed)
+    check("pages 0 and 1 were never written, so there is no row for them", not stored_present(obs, key_pidx(name2, 0)) and not stored_present(obs, key_pidx(name2, 1)), failed)
+    var past = alloc[UInt8](16)
+    check("a read past the end is a short read", fdb_read(fa, Int(past), 16, Int64(10 * PAGE)) == 522, failed)
+    # truncate to two pages: page 2's index row goes at the next commit
+    check("truncate to two pages", fdb_truncate(fa, Int64(2 * PAGE)) == 0, failed)
+    check("sync commits the truncate", fdb_sync(fa, 0) == 0, failed)
+    check("SIZE is two pages", stored_u64(obs, key_meta(name2, "SIZE")) == 2 * PAGE, failed)
+    check("page 2's index row is gone", not stored_present(obs, key_pidx(name2, 2)), failed)
+    check("the file exists to access", stored_u64(obs, key_meta(name2, "SIZE")) > 0, failed)
+    check("close", fdb_close(fa) == 0, failed)
+    check("vfs_delete", vfs_delete(vfs, Int(nm2.unsafe_ptr()), 0) == 0, failed)
+    check("delete cleared every key under the name", stored_u64(obs, key_meta(name2, "HEAD")) == -1 and stored_u64(obs, key_meta(name2, "SIZE")) == -1, failed)
 
     # leave nothing behind
     check("the database exists", stored_u64(obs, key_meta(name, "SIZE")) > 0, failed)
