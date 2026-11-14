@@ -27,7 +27,7 @@ KEYS_WITNESS_BUILD=${KEYS_WITNESS_BUILD:-build-keys-witness}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext keys-witness backup-fresh spec tla'
+ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext keys-witness mojo-keys backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -329,6 +329,27 @@ stage_keys_witness() {
 	ctest --test-dir "$KEYS_WITNESS_BUILD" --output-on-failure
 }
 
+# The Mojo port of `fdb_keys.h`: the real header compiled as the oracle and diffed against
+# the port, then the contract-witness-mojo gate. Needs pixi, and neither FoundationDB nor
+# SQLite. In the workspace the witness ladder is the sibling checkout `../witness-mojo`;
+# elsewhere WITNESS_MOJO names a clone of V-Sekai-fire/contract-witness-mojo, or the stage
+# clones one into the build directory.
+stage_mojo_keys() {
+	command -v pixi >/dev/null 2>&1 || { echo "missing: pixi"; return 1; }
+	wm=${WITNESS_MOJO:-}
+	if [ -z "$wm" ] && [ -d ../witness-mojo/src ]; then
+		wm=$(CDPATH= cd -- ../witness-mojo && pwd)
+	fi
+	if [ -z "$wm" ]; then
+		wm="$here/$BUILD/witness-mojo"
+		[ -d "$wm/src" ] || git clone --depth 1 https://github.com/V-Sekai-fire/contract-witness-mojo.git "$wm"
+	fi
+	[ -f "$wm/src/witness/ladder.mojo" ] || { echo "missing: $wm/src/witness/ladder.mojo"; return 1; }
+	cd mojo
+	mkdir -p build
+	pixi run parity
+	pixi run mojo run -I src -I "$wm/src" tests/keys_witness.mojo
+}
 # The probe weftspun-fdb's backup checks read, run against its own controls before a machine
 # arms it, so a regression fails here rather than leaving a production check critical.
 stage_backup_fresh() {
