@@ -1,0 +1,15 @@
+[workspace]
+name = "weft-store-mojo"
+version = "0.1.0"
+channels = ["https://conda.modular.com/max", "https://repo.prefix.dev/modular-community", "conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+mojo = "==1.1.0"
+
+[tasks]
+# The witness ladder lives in V-Sekai-fire/contract-witness-mojo. In the workspace it sits
+# at ../../witness-mojo; a standalone checkout clones it anywhere and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
+keys-witness = "mojo run -I src -I ../../witness-mojo/src tests/keys_witness.mojo"
+parity = "sh tests/parity.sh"
+test = { depends-on = ["parity", "keys-witness"] }
