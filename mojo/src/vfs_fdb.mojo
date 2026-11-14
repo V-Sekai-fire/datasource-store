@@ -18,8 +18,8 @@
 #
 # What it does not do yet, and refuses rather than gets wrong:
 #   * no compaction: a fold is not written here, though a store the C folded is read (SHARD rows)
-#   * no read-ahead, no cached read transaction, and no way to start a cross-database group, though
-#     a writer's open decides the groups the C left staging (recover_groups)
+#   * no read-ahead and no cached read transaction. It starts groups (weft_txn_begin and the rest)
+#     and a writer's open decides the groups the C left staging (recover_groups)
 #
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
@@ -95,6 +95,7 @@ struct FileState(Movable):
     var short_read: Bool
     var bases: Dict[Int, BaseEntry]
     var as_delta: List[Bool]
+    var group_txnid: Int  # nonzero while this file belongs to an open group: its syncs stage
 
     def __init__(out self, name: String, readonly: Bool):
         self.name = name.copy()
@@ -116,6 +117,7 @@ struct FileState(Movable):
         self.short_read = False
         self.bases = Dict[Int, BaseEntry]()
         self.as_delta = List[Bool]()
+        self.group_txnid = 0
 
     def base_get(self, pgno: Int) -> Optional[BaseEntry]:
         var e = self.bases.get(pgno % BASE_SLOTS)
@@ -139,11 +141,21 @@ struct Ctx(Movable):
     var fdb_addr: Int
     var files: List[FileState]
     var io_methods: Int
+    # The group being built: one at a time, as in the C. Its members are indexes into `files`, and
+    # `g_txids` holds the txid each staged under (its head, until it staged something).
+    var g_open: Bool
+    var g_txnid: Int
+    var g_files: List[Int]
+    var g_txids: List[Int]
 
     def __init__(out self, fdb_addr: Int):
         self.fdb_addr = fdb_addr
         self.files = List[FileState]()
         self.io_methods = 0
+        self.g_open = False
+        self.g_txnid = 0
+        self.g_files = List[Int]()
+        self.g_txids = List[Int]()
 
 
 def _ctx(addr: Int) -> Pointer[Ctx, MutAnyOrigin]:
@@ -1032,6 +1044,11 @@ def do_compact(mut ctx: Ctx, idx: Int) raises -> Int32:
 
 
 def do_flush(mut ctx: Ctx, idx: Int) raises -> Int32:
+    # A file that joined a group does not commit when SQLite says so. It stages, and the group's
+    # record is what commits it. This has to happen here, in xSync: by the time a caller could ask
+    # to stage, an ordinary flush would already have moved the head.
+    if ctx.files[idx].group_txnid != 0:
+        return stage_here(ctx, idx)
     ref fdb = _fdb(ctx.fdb_addr)[]
     ref f = ctx.files[idx]
     if len(f.pgnos) == 0 and f.trunc_pages < 0 and f.size == f.sent_size:
@@ -1091,6 +1108,246 @@ def do_flush(mut ctx: Ctx, idx: Int) raises -> Int32:
     return 0
 
 
+# ── Group commit ──────────────────────────────────────────────────────────────
+#
+# A group spans databases. Each member stages its pages under a txid above its head, where no read
+# can reach them; one transaction then writes the record, naming every member, and from that
+# moment the group is committed whether or not this process survives (see Group recovery above).
+# Then each head moves and the record is dropped. `fdb_vfs.c` is the model: weft_txn_begin, join,
+# commit and abort, and `spec/ParallelCommit.lean`.
+#
+# One difference: the C holds a lock from begin to commit, so a second begin waits. This VFS has
+# no lock to hold, and a second begin answers SQLITE_BUSY.
+
+comptime SQLITE_BUSY = 5
+comptime SQLITE_MISUSE = 21
+comptime SQLITE_TOOBIG = 18
+comptime SQLITE_FULL = 13
+comptime TXN_MAX_PARTS = 16
+comptime SQLITE_FCNTL_FILE_POINTER = 7
+
+
+# A participant's intent: its dirty pages, under head + 1, in one transaction so that it is all or
+# nothing and recovery can decide it by reading one key. The buffer is kept: this process still
+# sees its own writes, and resolving needs the page numbers.
+def stage_here(mut ctx: Ctx, idx: Int) raises -> Int32:
+    ref fdb = _fdb(ctx.fdb_addr)[]
+    var txid = 0
+    var r = Int32(0)
+    var staged = False
+    var head = 0
+    if True:
+        ref f = ctx.files[idx]
+        if len(f.pgnos) == 0 and f.trunc_pages < 0 and f.size == f.sent_size:
+            return 0
+        if len(f.pgnos) > ONE_TXN_PAGES:
+            return Int32(SQLITE_TOOBIG)
+        head = f.head
+        txid = f.head + 1
+        f.as_delta = List[Bool]()
+        for _ in range(len(f.pgnos)):
+            f.as_delta.append(False)
+        if len(f.pgnos) > 0:
+            while True:
+                var t = Txn(fdb)
+                var code = delta_body(fdb, t, f, txid, 0, len(f.pgnos))
+                r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+                if r == -1:
+                    continue
+                break
+            staged = True
+    if r != 0:
+        return r
+    for i in range(len(ctx.g_files)):
+        if ctx.g_files[i] == idx:
+            ctx.g_txids[i] = txid if staged else head
+            return 0
+    # a file flagged as a member that is not in the group is a bug in the bookkeeping
+    return Int32(SQLITE_MISUSE)
+
+
+def seq_body(fdb: Fdb, t: Txn, mut txnid: Int) raises -> Int32:
+    # the next group id, from a counter in the store: a read and a write in one transaction, so
+    # two stores cannot choose the same one
+    var key = key_txn_all()
+    key.append(UInt8(78))  # N
+    key.append(UInt8(69))  # E
+    key.append(UInt8(88))  # X
+    key.append(UInt8(84))  # T
+    var r = t.get_result(fdb, key)
+    if r.code != 0:
+        return r.code
+    txnid = (be64_of(r) + 1) if r.present else 1
+    t.set(fdb, key, u64_value(txnid))
+    return 0
+
+
+def release_group(mut c: Ctx):
+    for i in range(len(c.g_files)):
+        c.files[c.g_files[i]].group_txnid = 0
+    c.g_files = List[Int]()
+    c.g_txids = List[Int]()
+    c.g_open = False
+    c.g_txnid = 0
+
+
+def weft_txn_begin(ctx_addr: Int, mut txnid: Int) raises -> Int32:
+    ref c = _ctx(ctx_addr)[]
+    if c.g_open:
+        return Int32(SQLITE_BUSY)
+    ref fdb = _fdb(c.fdb_addr)[]
+    var id = 0
+    var r = Int32(0)
+    while True:
+        var t = Txn(fdb)
+        var code = seq_body(fdb, t, id)
+        r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+        if r == -1:
+            continue
+        break
+    if r != 0:
+        return r
+    c.g_open = True
+    c.g_txnid = id
+    c.g_files = List[Int]()
+    c.g_txids = List[Int]()
+    txnid = id
+    return 0
+
+
+# Join a database to the group, before it is written to: from here its syncs stage.
+def weft_txn_join(lib: OwnedDLHandle, ctx_addr: Int, db: Int, txnid: Int) raises -> Int32:
+    ref c = _ctx(ctx_addr)[]
+    if not c.g_open or c.g_txnid != txnid:
+        return Int32(SQLITE_MISUSE)
+    if len(c.g_files) >= TXN_MAX_PARTS:
+        return Int32(SQLITE_FULL)
+    var slot = alloc[Int](1)
+    slot[unsafe_offset=0] = 0
+    var rc = lib.call["sqlite3_file_control", Int32](db, "main".unsafe_ptr(), Int32(SQLITE_FCNTL_FILE_POINTER), slot)
+    var file = slot[unsafe_offset=0]
+    # the file must be this VFS's, or its bytes mean nothing here
+    if rc != 0 or file == 0 or peek64(file) != c.io_methods or peek64(file + 8) != ctx_addr:
+        return Int32(SQLITE_MISUSE)
+    var idx = peek64(file + 16)
+    for i in range(len(c.g_files)):
+        if c.g_files[i] == idx:
+            return 0
+    c.g_files.append(idx)
+    c.g_txids.append(c.files[idx].head)
+    c.files[idx].group_txnid = txnid
+    return 0
+
+
+# The commit: one transaction writes the record as staging. The fence of every member is read in
+# it, so a member that lost ownership while staging cannot be carried into the group. The record
+# names each member, the txid it staged under, and the size its commit ends with: recovery has no
+# open handle, and the size is nowhere else.
+def record_body(fdb: Fdb, t: Txn, c: Ctx, txnid: Int) raises -> Int32:
+    for i in range(len(c.g_files)):
+        var fc = check_fence(fdb, t, c.files[c.g_files[i]])
+        if fc != 0:
+            return fc
+    for i in range(len(c.g_files)):
+        ref f = c.files[c.g_files[i]]
+        var val = u64_value(c.g_txids[i])
+        var sz = u64_value(f.size)
+        for j in range(len(sz)):
+            val.append(sz[j])
+        t.set(fdb, key_txn_part(UInt64(txnid), f.name), val)
+    var st = List[UInt8]()
+    st.append(UInt8(TXN_STAGING))
+    t.set(fdb, key_txn_status(UInt64(txnid)), st)
+    return 0
+
+
+def set_status_body(fdb: Fdb, t: Txn, txnid: Int, status: Int) raises -> Int32:
+    var st = List[UInt8]()
+    st.append(UInt8(status))
+    t.set(fdb, key_txn_status(UInt64(txnid)), st)
+    return 0
+
+
+# Move one member's head, which is what makes its staged pages reachable. It may run more than
+# once and from more than one process, so it is safe to repeat.
+def resolve_part(mut c: Ctx, i: Int) raises -> Int32:
+    ref fdb = _fdb(c.fdb_addr)[]
+    var idx = c.g_files[i]
+    var staged = c.g_txids[i]
+    ref f = c.files[idx]
+    if staged <= f.head:
+        return 0  # already resolved by somebody
+    var r = Int32(0)
+    while True:
+        var t = Txn(fdb)
+        var code = head_body(fdb, t, f, staged)
+        r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+        if r == -1:
+            continue
+        break
+    if r != 0:
+        return r
+    f.head = staged
+    f.sent_size = f.size
+    f.log_pages += len(f.pgnos)
+    f.trunc_pages = -1
+    f.clear_dirty()
+    return 0
+
+
+def weft_txn_commit(ctx_addr: Int, txnid: Int) raises -> Int32:
+    ref c = _ctx(ctx_addr)[]
+    if not c.g_open or c.g_txnid != txnid:
+        return Int32(SQLITE_MISUSE)
+    ref fdb = _fdb(c.fdb_addr)[]
+    var r = Int32(0)
+    while True:
+        var t = Txn(fdb)
+        var code = record_body(fdb, t, c, txnid)
+        r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+        if r == -1:
+            continue
+        break
+    if r != 0:
+        release_group(c)
+        return r
+    # Implicitly committed from here. Resolving moves the heads, and a failure to resolve is not
+    # a failure to commit: the next open's recovery finishes it.
+    var done = True
+    for i in range(len(c.g_files)):
+        if done and resolve_part(c, i) != 0:
+            done = False
+    if done:
+        while True:
+            var t = Txn(fdb)
+            var code = set_status_body(fdb, t, txnid, TXN_COMMITTED)
+            var r2 = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+            if r2 == -1:
+                continue
+            break
+        # the record has done its work; keeping it would make the recovery sweep grow without bound
+        while True:
+            var t = Txn(fdb)
+            var code = drop_record_body(fdb, t, txnid)
+            var r3 = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+            if r3 == -1:
+                continue
+            break
+    release_group(c)
+    return 0
+
+
+# Give up a group that was begun and not committed. No record was written, so there is nothing to
+# decide: the staged pages are unreachable, and the next open clears them. A member's buffered
+# pages stay, as in the C, so its next sync commits them in the ordinary way.
+def weft_txn_abort(ctx_addr: Int, txnid: Int) raises -> Int32:
+    ref c = _ctx(ctx_addr)[]
+    if not c.g_open or c.g_txnid != txnid:
+        return Int32(SQLITE_MISUSE)
+    release_group(c)
+    return 0
+
+
 # ── sqlite3_io_methods ────────────────────────────────────────────────────────
 
 def _file_ctx(file: Int) -> Pointer[Ctx, MutAnyOrigin]:
@@ -1101,7 +1358,7 @@ def fdb_close(file: Int) abi("C") -> Int32:
     try:
         var idx = peek64(file + 16)
         var rc = do_flush(_file_ctx(file)[], idx)
-        if rc == 0 and _file_ctx(file)[].files[idx].compact_due:
+        if rc == 0 and _file_ctx(file)[].files[idx].compact_due and _file_ctx(file)[].files[idx].group_txnid == 0:
             _file_ctx(file)[].files[idx].compact_due = False
             rc = do_compact(_file_ctx(file)[], idx)
         _file_ctx(file)[].files[idx].clear_dirty()
