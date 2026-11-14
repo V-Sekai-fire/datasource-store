@@ -62,13 +62,15 @@ dump() { "$FDBCLI" -C "$CF" --exec 'getrange "" \xff 1000000' | grep -v '^$' | g
 SESS1="create table t(id integer primary key, v text); with recursive c(x) as (select 1 union all select x+1 from c where x<400) insert into t select x, 'row-' || x from c;"
 SESS2="update t set v='edited' where id % 97 = 0;"
 SESS4="update t set v='tail' where id=7;"
+SESS5="create table big(id integer primary key, v text); with recursive c(x) as (select 1 union all select x+1 from c where x<2300) insert into big select x, replace(hex(zeroblob(1950)),'0','a') from c;"
+SESS6="with recursive c(x) as (select 1 union all select x+1 from c where x<2150) insert into big select x+5000, replace(hex(zeroblob(1950)),'0','a') from c;"
 SESS3="insert into t select id+1000, 'late-' || id from t where id <= 40; delete from t where id between 100 and 130;"
 echo "== bit equality"
 wipe
-c_sql "$PRAGMAS $SESS1" eq.db >/dev/null; c_sql "$PRAGMAS $SESS2" eq.db >/dev/null; c_sql "$PRAGMAS $SESS3" eq.db >/dev/null; c_sql "$PRAGMAS $SESS4" eq.db >/dev/null
+c_sql "$PRAGMAS $SESS1" eq.db >/dev/null; c_sql "$PRAGMAS $SESS2" eq.db >/dev/null; c_sql "$PRAGMAS $SESS3" eq.db >/dev/null; c_sql "$PRAGMAS $SESS4" eq.db >/dev/null; c_sql "$PRAGMAS $SESS5" eq.db >/dev/null; c_sql "$PRAGMAS $SESS6" eq.db >/dev/null
 dump > /tmp/eq-c.txt
 wipe
-mojo_step eq-1; mojo_step eq-2; mojo_step eq-3; mojo_step eq-4
+mojo_step eq-1; mojo_step eq-2; mojo_step eq-3; mojo_step eq-4; mojo_step eq-5; mojo_step eq-6
 dump > /tmp/eq-m.txt
 echo "C wrote $(wc -l < /tmp/eq-c.txt) rows, Mojo wrote $(wc -l < /tmp/eq-m.txt); delta rows in each: $(grep -c "DELTA\|\\xd7" /tmp/eq-c.txt) / $(grep -c "DELTA\|\\xd7" /tmp/eq-m.txt)"
 if cmp -s /tmp/eq-c.txt /tmp/eq-m.txt && [ -s /tmp/eq-c.txt ]; then echo "ok    the C and the Mojo VFS left identical bytes in FoundationDB"; else echo "FAIL  the stores differ"; diff /tmp/eq-c.txt /tmp/eq-m.txt | cut -c1-200 | head -20; fail=1; fi

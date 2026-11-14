@@ -61,6 +61,12 @@ if [ -n "${MUTANTS:-}" ]; then
 	mutant vfs-fdb $V "fold: the index is not cleared" sed -i 's/t.clear_range(fdb, pidx, key_after(pidx))/pass/' $V
 	mutant vfs-fdb $V "fold: the log rows are not cleared" sed -i 's/t.clear_range(fdb, delta, key_after(delta))/pass/' $V
 	mutant vfs-fdb $V "fold: LOGN is not reset" sed -i 's/t.set(fdb, key_meta(f.name, "LOGN"), u64_value(0))/pass/' $V
+	mutant vfs-fdb $V "recovery: a committed group is not resolved" sed -i 's/t.set(fdb, key_meta(p.name, "HEAD"), u64_value(p.txid))/pass/' $V
+	mutant vfs-fdb $V "recovery: an abort fences a healthy participant" sed -i 's/    if fence_it:/    if True:/' $V
+	mutant vfs-fdb $V "recovery: a decided record is not dropped" sed -i 's/t.clear_range(fdb, pre, key_after(pre))\n    return 0\n\n\ndef recover_one/XX/;/^def drop_record_body/,/return 0/{s/    t.clear_range(fdb, pre, key_after(pre))/    pass/}' $V
+	mutant vfs-fdb $V "recovery: a writer's open never runs it" sed -i 's/        var rec = recover_groups(fdb)/        var rec = Int32(0)/' $V
+	mutant vfs-fdb $V "staging: the last chunk is never written" sed -i 's/            lo += STAGE_TXN_PAGES/            lo += 2 * STAGE_TXN_PAGES/' $V
+	mutant vfs-fdb $V "staging: a chunk does not check the fence" perl -0pi -e 's/(def delta_body.*?\n)    var fc = check_fence\(fdb, t, f\)\n    if fc != 0:\n        return fc\n/$1/s' $V
 	cp /tmp/fdb_client.orig src/fdb_client.mojo
 	cp /tmp/vfs_fdb.orig src/vfs_fdb.mojo
 fi

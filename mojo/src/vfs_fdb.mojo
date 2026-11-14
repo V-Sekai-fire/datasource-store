@@ -9,15 +9,17 @@
 #            base row, else the newest shard's SHARD/<as_of>/<pgno> when no commit owns the page;
 #            one FoundationDB transaction per call, retried the way FoundationDB asks
 #   write    buffers whole pages; a partial page is read from the store first
-#   sync     one transaction: the fence check, the DELTA rows, the PIDX rows, SIZE, LOGN, HEAD.
+#   sync     one transaction: the fence check, the DELTA rows, the PIDX rows, SIZE, LOGN, HEAD;
+#            above ONE_TXN_PAGES the DELTA rows go first, STAGE_TXN_PAGES to a transaction, and
+#            one last transaction moves the head.
 #            A page with a base row is sent as a delta when under a fifth of it changed, else whole
 #   truncate drops buffered pages, and clears the PIDX rows past the end at the next commit
 #   delete   clears everything under weft/db/<name>/
 #
 # What it does not do yet, and refuses rather than gets wrong:
 #   * no compaction: a fold is not written here, though a store the C folded is read (SHARD rows)
-#   * a commit above ONE_TXN_PAGES is refused: staged commits are not here
-#   * no read-ahead, no cached read transaction, no cross-database commit, no fold
+#   * no read-ahead, no cached read transaction, and no way to start a cross-database group, though
+#     a writer's open decides the groups the C left staging (recover_groups)
 #
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
@@ -247,7 +249,241 @@ def open_body(fdb: Fdb, t: Txn, mut f: FileState) raises -> Int32:
     return 0
 
 
+# ── Group recovery ────────────────────────────────────────────────────────────
+#
+# A group commit stages one intent per database, then writes a record at weft/txn/<id>. Once the
+# record is written the group is implicitly committed: every intent is durable, and any process
+# that finds the record must finish it, whatever it wanted to do. If an intent is missing the
+# group can never commit, so it is prevented. `recover_one` in `fdb_vfs.c` decides a record from
+# the record alone, and `ParallelCommit.lean` is the model.
+#
+# This runs before a writer's open raises the fence or clears the rows above the head. The order
+# is not a preference: a fence raised over an implicitly committed group destroys a write that
+# was already acknowledged. A reader neither decides records nor raises a fence, so it skips this.
+# Every outcome is safe to repeat, so any finder of a record may decide it.
+
+struct GroupPart(Copyable, Movable):
+    var name: String
+    var txid: Int
+    var size: Int
+    var present: Bool
+    var head: Int
+    var pgnos: List[Int]
+
+    def __init__(out self, name: String, txid: Int, size: Int):
+        self.name = name.copy()
+        self.txid = txid
+        self.size = size
+        self.present = False
+        self.head = 0
+        self.pgnos = List[Int]()
+
+
+# Every row of [begin, end), following `more` until the range is done.
+def all_rows(fdb: Fdb, t: Txn, begin: List[UInt8], end: List[UInt8]) raises -> RangeResult:
+    var keys = List[List[UInt8]]()
+    var values = List[List[UInt8]]()
+    var b = begin.copy()
+    var after = False
+    while True:
+        var r = t.range_rows(fdb, b, after, end)
+        if r.code != 0:
+            return RangeResult(r.code, False, keys^, values^)
+        for i in range(len(r.keys)):
+            keys.append(r.keys[i].copy())
+            values.append(r.values[i].copy())
+        if not r.more or len(r.keys) == 0:
+            break
+        b = r.keys[len(r.keys) - 1].copy()
+        after = True
+    return RangeResult(0, False, keys^, values^)
+
+
+# Every record still staging. `weft/txn/NEXT` sorts under the same prefix and is skipped by shape:
+# a record's status key is the prefix, an 8 byte txid and "/STATUS".
+def sweep_body(fdb: Fdb, t: Txn, mut staging: List[Int]) raises -> Int32:
+    staging = List[Int]()
+    var begin = key_txn_all()
+    var r = all_rows(fdb, t, begin, key_after(begin))
+    if r.code != 0:
+        return r.code
+    var plen = len(begin)
+    for i in range(len(r.keys)):
+        ref k = r.keys[i]
+        if len(k) == plen + 8 + 7 and k[plen + 8] == 0x2F and k[len(k) - 1] == 0x53:
+            if len(r.values[i]) == 1 and Int(r.values[i][0]) == TXN_STAGING:
+                staging.append(Int(get_be64(k, plen)))
+    return 0
+
+
+# The participants of one record: the database name, the txid it staged under, and the size its
+# commit ends with. Recovery has no open handle, so the record carries all it needs.
+def read_parts_body(fdb: Fdb, t: Txn, txnid: Int, mut parts: List[GroupPart]) raises -> Int32:
+    parts = List[GroupPart]()
+    var pre = key_txn_part_prefix(UInt64(txnid))
+    var r = all_rows(fdb, t, pre, key_after(pre))
+    if r.code != 0:
+        return r.code
+    for i in range(len(r.keys)):
+        if len(r.values[i]) != 16 or len(r.keys[i]) <= len(pre):
+            continue
+        var name = String()
+        for j in range(len(pre), len(r.keys[i])):
+            name += chr(Int(r.keys[i][j]))
+        parts.append(GroupPart(name, Int(get_be64(r.values[i], 0)), Int(get_be64(r.values[i], 8))))
+    return 0
+
+
+# QueryIntent. A participant staged in one transaction, so its pages are all there or none are.
+# One that wrote nothing, or was resolved already, staged at or below its head: nothing can be
+# missing. The page numbers come back too, because resolving needs them to write the index.
+def query_intent_body(fdb: Fdb, t: Txn, mut p: GroupPart) raises -> Int32:
+    p.present = False
+    p.pgnos = List[Int]()
+    var h = t.get_result(fdb, key_meta(p.name, "HEAD"))
+    if h.code != 0:
+        return h.code
+    p.head = be64_of(h)
+    if p.txid <= p.head:
+        p.present = True
+        return 0
+    var pre = key_delta_txid(p.name, UInt64(p.txid))
+    var r = all_rows(fdb, t, pre, key_after(pre))
+    if r.code != 0:
+        return r.code
+    for i in range(len(r.keys)):
+        if len(r.keys[i]) >= 4:
+            p.pgnos.append(pgno_of_key(r.keys[i]))
+    p.present = len(r.keys) > 0
+    return 0
+
+
+# Resolve one participant from the record alone: point its index at the staged pages and move
+# its size and its head. This is `put_head` without an open file.
+def resolve_body(fdb: Fdb, t: Txn, p: GroupPart) raises -> Int32:
+    var h = t.get_result(fdb, key_meta(p.name, "HEAD"))
+    if h.code != 0:
+        return h.code
+    if p.txid <= be64_of(h):
+        return 0  # somebody resolved it first
+    for i in range(len(p.pgnos)):
+        t.set(fdb, key_pidx(p.name, UInt32(p.pgnos[i])), u64_value(p.txid))
+    t.set(fdb, key_meta(p.name, "SIZE"), u64_value(p.size))
+    var l = t.get_result(fdb, key_meta(p.name, "LOGN"))
+    if l.code != 0:
+        return l.code
+    t.set(fdb, key_meta(p.name, "LOGN"), u64_value(be64_of(l) + len(p.pgnos)))
+    t.set(fdb, key_meta(p.name, "HEAD"), u64_value(p.txid))
+    return 0
+
+
+# Give up one participant of an aborted group. The pages always go: nothing will ever point at
+# them. The fence goes up only for the participant whose intent was missing, which is the write
+# that must never land. Raising it on a healthy participant would invalidate every live handle on
+# a database that had nothing wrong with it.
+def prevent_body(fdb: Fdb, t: Txn, p: GroupPart, fence_it: Bool) raises -> Int32:
+    if fence_it:
+        var fr = t.get_result(fdb, key_meta(p.name, "FENCE"))
+        if fr.code != 0:
+            return fr.code
+        t.set(fdb, key_meta(p.name, "FENCE"), u64_value((be64_of(fr) + 1) if fr.present else 1))
+    var pre = key_delta_txid(p.name, UInt64(p.txid))
+    t.clear_range(fdb, pre, key_after(pre))
+    return 0
+
+
+def drop_record_body(fdb: Fdb, t: Txn, txnid: Int) raises -> Int32:
+    var pre = key_txn_prefix(UInt64(txnid))
+    t.clear_range(fdb, pre, key_after(pre))
+    return 0
+
+
+def recover_one(fdb: Fdb, txnid: Int) raises -> Int32:
+    var parts = List[GroupPart]()
+    while True:
+        var t = Txn(fdb)
+        var code = read_parts_body(fdb, t, txnid, parts)
+        var r = settle(fdb, t, code, False, Int32(SQLITE_IOERR_READ))
+        if r == -1:
+            continue
+        if r != 0:
+            return r
+        break
+    # Query every intent before changing anything: the decision depends on all of them, and a
+    # partial answer is the one thing that must not drive it.
+    var all_present = True
+    for i in range(len(parts)):
+        while True:
+            var t = Txn(fdb)
+            var code = query_intent_body(fdb, t, parts[i])
+            var r = settle(fdb, t, code, False, Int32(SQLITE_IOERR_READ))
+            if r == -1:
+                continue
+            if r != 0:
+                return r
+            break
+        if not parts[i].present:
+            all_present = False
+    if len(parts) > 0 and all_present:
+        # Implicitly committed. Finishing it is not a choice.
+        for i in range(len(parts)):
+            while True:
+                var t = Txn(fdb)
+                var code = resolve_body(fdb, t, parts[i])
+                var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+                if r == -1:
+                    continue
+                if r != 0:
+                    return r
+                break
+    elif len(parts) > 0:
+        for i in range(len(parts)):
+            while True:
+                var t = Txn(fdb)
+                var code = prevent_body(fdb, t, parts[i], not parts[i].present)
+                var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+                if r == -1:
+                    continue
+                if r != 0:
+                    return r
+                break
+    # A record with no participants decides nothing and cannot be committed; drop it too.
+    while True:
+        var t = Txn(fdb)
+        var code = drop_record_body(fdb, t, txnid)
+        var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+        if r == -1:
+            continue
+        return r
+
+
+# Decide every staging record. Each pass removes records, so this ends.
+def recover_groups(fdb: Fdb) raises -> Int32:
+    for _ in range(1000):
+        var staging = List[Int]()
+        while True:
+            var t = Txn(fdb)
+            var code = sweep_body(fdb, t, staging)
+            var r = settle(fdb, t, code, False, Int32(SQLITE_IOERR_READ))
+            if r == -1:
+                continue
+            if r != 0:
+                return r
+            break
+        if len(staging) == 0:
+            return 0
+        for i in range(len(staging)):
+            var rc = recover_one(fdb, staging[i])
+            if rc != 0:
+                return rc
+    return Int32(SQLITE_IOERR)
+
+
 def do_open(mut ctx: Ctx, fdb: Fdb, idx: Int) raises -> Int32:
+    if not ctx.files[idx].readonly:
+        var rec = recover_groups(fdb)
+        if rec != 0:
+            return rec
     while True:
         var t = Txn(fdb)
         var code = open_body(fdb, t, ctx.files[idx])
@@ -420,12 +656,11 @@ def do_write(mut ctx: Ctx, idx: Int, buf: Int, amt: Int, off: Int) raises -> Int
     return 0
 
 
-def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
-    var fc = check_fence(fdb, t, f)
-    if fc != 0:
-        return fc
-    f.as_delta = List[Bool]()
-    for i in range(len(f.pgnos)):
+# The pages of the commit under a txid no read can reach yet: pages lo..hi of the dirty buffer.
+# A page with a base row goes as a delta when under a fifth of it changed, else whole. This
+# sets as_delta for each page it sends, which the commit reads afterwards.
+def put_delta_pages(fdb: Fdb, t: Txn, mut f: FileState, txid: Int, lo: Int, hi: Int) raises:
+    for i in range(lo, hi):
         var pgno = UInt32(f.pgnos[i])
         var row = List[UInt8]()
         # borrow the base entry: it is a 4 KB row, and a copy per page costs more than the encode
@@ -435,11 +670,16 @@ def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
             if be.pgno == f.pgnos[i] and be.kind != 0:
                 row = delta_encode(be.bytes, f.pages[i], be.kind, UInt64(be.id))
         if len(row) > 0:
-            f.as_delta.append(True)
+            f.as_delta[i] = True
             t.set(fdb, key_delta(f.name, UInt64(txid), pgno), row)
         else:
-            f.as_delta.append(False)
+            f.as_delta[i] = False
             t.set(fdb, key_delta(f.name, UInt64(txid), pgno), f.pages[i])
+
+
+# What makes a commit visible: PIDX points at the new txid, the size moves, and the head
+# advances. All of it lands together or none of it does.
+def put_head(fdb: Fdb, t: Txn, f: FileState, txid: Int) raises:
     for i in range(len(f.pgnos)):
         t.set(fdb, key_pidx(f.name, UInt32(f.pgnos[i])), u64_value(txid))
     if f.trunc_pages >= 0:
@@ -448,6 +688,35 @@ def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
     t.set(fdb, key_meta(f.name, "SIZE"), u64_value(f.size))
     t.set(fdb, key_meta(f.name, "LOGN"), u64_value(f.log_pages + len(f.pgnos)))
     t.set(fdb, key_meta(f.name, "HEAD"), u64_value(txid))
+
+
+# The whole commit in one transaction: the pages and the head together. A commit that fits one
+# transaction needs no staging, because its pages are never visible before the head moves.
+def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
+    var fc = check_fence(fdb, t, f)
+    if fc != 0:
+        return fc
+    put_delta_pages(fdb, t, f, txid, 0, len(f.pgnos))
+    put_head(fdb, t, f, txid)
+    return 0
+
+
+# One staging transaction of a commit too large for one: pages lo..hi, under a txid above the
+# head. Every staging transaction checks the fence, so a stale writer stops at its first chunk.
+def delta_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int, lo: Int, hi: Int) raises -> Int32:
+    var fc = check_fence(fdb, t, f)
+    if fc != 0:
+        return fc
+    put_delta_pages(fdb, t, f, txid, lo, hi)
+    return 0
+
+
+# The transaction that makes a staged commit real: PIDX, SIZE, LOGN and HEAD together.
+def head_body(fdb: Fdb, t: Txn, f: FileState, txid: Int) raises -> Int32:
+    var fc = check_fence(fdb, t, f)
+    if fc != 0:
+        return fc
+    put_head(fdb, t, f, txid)
     return 0
 
 
@@ -767,30 +1036,59 @@ def do_flush(mut ctx: Ctx, idx: Int) raises -> Int32:
     ref f = ctx.files[idx]
     if len(f.pgnos) == 0 and f.trunc_pages < 0 and f.size == f.sent_size:
         return 0
-    if len(f.pgnos) > ONE_TXN_PAGES:
-        return Int32(SQLITE_IOERR_WRITE)  # a staged commit is not here yet
     var txid = f.head + 1
-    while True:
-        var t = Txn(fdb)
-        var code = commit_body(fdb, t, f, txid)
-        var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
-        if r == -1:
-            continue
-        if r != 0:
-            return r
-        for i in range(len(f.pgnos)):
-            if not f.as_delta[i]:
-                var whole = f.pages[i].copy()
-                f.base_put(f.pgnos[i], BASE_TXID, txid, whole)
-        f.head = txid
-        f.sent_size = f.size
-        f.log_pages += len(f.pgnos)
-        f.trunc_pages = -1
-        f.clear_dirty()
-        # A fold is noted, not done, on the commit that trips the ratio: it is paid at close.
-        if should_compact(f):
-            f.compact_due = True
-        return 0
+    f.as_delta = List[Bool]()
+    for _ in range(len(f.pgnos)):
+        f.as_delta.append(False)
+    var r = Int32(0)
+    if len(f.pgnos) <= ONE_TXN_PAGES:
+        while True:
+            var t = Txn(fdb)
+            var code = commit_body(fdb, t, f, txid)
+            r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+            if r == -1:
+                continue
+            break
+    else:
+        # Too large for one transaction: the pages first, STAGE_TXN_PAGES to a transaction under
+        # a txid no read can reach, then one transaction that moves the head. A process that dies
+        # in between leaves pages nothing points at, and the next open clears them.
+        var lo = 0
+        while lo < len(f.pgnos) and r == 0:
+            var hi = lo + STAGE_TXN_PAGES
+            if hi > len(f.pgnos):
+                hi = len(f.pgnos)
+            while True:
+                var t = Txn(fdb)
+                var code = delta_body(fdb, t, f, txid, lo, hi)
+                r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+                if r == -1:
+                    continue
+                break
+            lo += STAGE_TXN_PAGES
+        if r == 0:
+            while True:
+                var t = Txn(fdb)
+                var code = head_body(fdb, t, f, txid)
+                r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+                if r == -1:
+                    continue
+                break
+    if r != 0:
+        return r
+    for i in range(len(f.pgnos)):
+        if not f.as_delta[i]:
+            var whole = f.pages[i].copy()
+            f.base_put(f.pgnos[i], BASE_TXID, txid, whole)
+    f.head = txid
+    f.sent_size = f.size
+    f.log_pages += len(f.pgnos)
+    f.trunc_pages = -1
+    f.clear_dirty()
+    # A fold is noted, not done, on the commit that trips the ratio: it is paid at close.
+    if should_compact(f):
+        f.compact_due = True
+    return 0
 
 
 # ── sqlite3_io_methods ────────────────────────────────────────────────────────

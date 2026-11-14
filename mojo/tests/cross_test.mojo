@@ -136,6 +136,18 @@ def main() raises:
         pragmas(lib, db)
         check("a last small update", run(lib, db, "update t set v='tail' where id=7") == 0, failed)
         _ = lib.call["sqlite3_close", Int32](db)
+    elif step == "eq-5":
+        # a commit too large for one transaction: about 2,300 pages, staged, then folded at close
+        var db = open_db(lib, "eq.db", V)
+        pragmas(lib, db)
+        check("a staged commit of about 2300 pages", run(lib, db, "create table big(id integer primary key, v text); with recursive c(x) as (select 1 union all select x+1 from c where x<2300) insert into big select x, replace(hex(zeroblob(1950)),'0','a') from c") == 0, failed)
+        _ = lib.call["sqlite3_close", Int32](db)
+    elif step == "eq-6":
+        # a second staged commit, smaller than the base, so no fold is owed and its staged rows stay
+        var db = open_db(lib, "eq.db", V)
+        pragmas(lib, db)
+        check("a second staged commit, left as log rows", run(lib, db, "with recursive c(x) as (select 1 union all select x+1 from c where x<2150) insert into big select x+5000, replace(hex(zeroblob(1950)),'0','a') from c") == 0, failed)
+        _ = lib.call["sqlite3_close", Int32](db)
     else:
         raise Error("CROSS_STEP is not one of clean, write-m, read-m, read-c")
 

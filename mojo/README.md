@@ -31,7 +31,8 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | 3b | FoundationDB client binding (network thread, transactions) | `fdb_c.h` use in `fdb_vfs.c` | Done. `src/fdb_client.mojo` |
 | 3c-1 | The two joined, first cut: open, read, write, commit, fence, truncate, delete | `fdb_vfs.c` | Done. `src/vfs_fdb.mojo` |
 | 3c-2 | Shard reads, delta writes, and the fold at close | `fdb_vfs.c` | Done. Same bytes as the C: `tests/cross.sh` |
-| 3c-3 | Staged commits above one transaction, read-ahead, a pipelined fold, cross-database commit, readers that follow the head | `fdb_vfs.c` | Not started |
+| 3c-3 | Staged commits above one transaction, and recovery of group commits another committer left staging | `fdb_vfs.c` | Done. Same bytes as the C for 2,300-page commits: `tests/cross.sh` |
+| 3c-4 | Read-ahead, starting a cross-database group, readers that follow the head | `fdb_vfs.c` | Not started |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
 
@@ -133,8 +134,9 @@ numbers start at 0, as in the C (`offset / 4096`), so SQLite's header is `PIDX/0
   PIDX and DELTA rows and SQLite's header in page 0. A reopen sees the rows; a third open raises
   the fence and the stale handle's commit is refused with HEAD unmoved; a read-only open takes no
   fence; a commit staged above HEAD is cleared by the next open.
-- It refuses what it cannot yet do: a commit above `ONE_TXN_PAGES` fails. A store the C folded
-  opens (slice 3c-2), pages with a base row go as deltas, and the file folds at close.
+- A store the C folded opens (slice 3c-2), pages with a base row go as deltas, and the file folds
+  at close. A commit above `ONE_TXN_PAGES` stages its pages `STAGE_TXN_PAGES` to a transaction under a
+  txid no read can reach, then one transaction moves the head (slice 3c-3).
 - Runs in CI's `test` job with the client test, and in `tests/fdb_container.sh` against a throwaway
   server. With `MUTANTS=1` the script breaks the client five ways and the VFS five ways (no fence
   check, no index rows, an unfinished commit left behind, no fence raise, HEAD not advanced, a read
@@ -199,3 +201,18 @@ that wait a Mojo run that followed a C run read 2.5 s, which was the wipe and no
 FoundationDB: single commits are equal, batched writes are 93 to 98 percent of the C's, and a
 feed read after the writes is about 75 percent of it, for a reason not found yet. The fold at
 close is within about 5 percent of the C's (table above).
+
+## Slice 3c-3: big commits and other committers
+
+A commit above `ONE_TXN_PAGES` (1,857 pages) stages. Its pages go first, `STAGE_TXN_PAGES` (2,100)
+to a transaction, each transaction checking the fence, and one last transaction writes the index,
+the size and the head. A process that dies between leaves rows above the head that nothing points
+at, and the next open clears them.
+
+Other committers matter here. A group commit stages one intent per database, then writes a record
+at `weft/txn/<id>`. After that record lands the group is committed, whether or not its writer
+survives. So a writer's open decides every staging record before it raises the fence or clears the
+rows above the head, as `recover_one` does in the C: all intents durable finishes the group, a
+missing intent aborts it and raises the fence of the participant that lacked one, and no other. A
+reader skips this. This VFS decides groups; it cannot start one. A group participant must stage in
+one transaction in the C, so a group never takes the chunked path.

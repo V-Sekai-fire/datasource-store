@@ -88,6 +88,17 @@ def count_rows(fdb: Fdb, prefix: List[UInt8]) raises -> Int:
     return n
 
 
+# Open and report the SQLite code instead of raising, so a refusal is a failed check.
+def open_rc(lib: OwnedDLHandle, name: String, vfs: String, flags: Int, mut handle: Int) raises -> Int32:
+    var slot = alloc[Int](1)
+    slot[unsafe_offset=0] = 0
+    var n = name.copy()
+    var v = vfs.copy()
+    var rc = lib.call["sqlite3_open_v2", Int32](n.unsafe_ptr(), slot, Int32(flags), v.unsafe_ptr())
+    handle = slot[unsafe_offset=0]
+    return rc
+
+
 def main() raises:
     var failed = 0
     var cluster = getenv("WEFT_FDB_CLUSTER_FILE")
@@ -314,6 +325,184 @@ def main() raises:
     tfe.clear_range(obs, key_meta(fname, ""), key_after(key_meta(fname, "")))
     check("clean up the fold database", tfe.commit(obs) == 0, failed)
     tfe.destroy(obs)
+
+    # A commit too large for one transaction stages: its pages go first, under a txid above the
+    # head, and one last transaction moves the head. ONE_TXN_PAGES is about 1,850 pages and a staging
+    # transaction holds about 2,100, so 2,300 rows of 3,900 bytes in one SQLite transaction (a page
+    # each) take two staging transactions and the head's.
+    var gname = String("mojo-vfs-staged")
+    var tgc = Txn(obs)
+    tgc.clear_range(obs, key_meta(gname, ""), key_after(key_meta(gname, "")))
+    check("clear the staged-commit database", tgc.commit(obs) == 0, failed)
+    tgc.destroy(obs)
+    var dbs = open_db(lib, gname, V, 6)
+    check("staged: create", run(lib, dbs, "pragma journal_mode=memory; pragma locking_mode=exclusive; create table s(id integer primary key, v blob)") == 0, failed)
+    var shead0 = stored_u64(obs, key_meta(gname, "HEAD"))
+    check("staged: 2300 rows of 3900 bytes in one transaction", run(lib, dbs, "with recursive c(x) as (select 1 union all select x+1 from c where x<2300) insert into s select x, zeroblob(3900) from c") == 0, failed)
+    var shead1 = stored_u64(obs, key_meta(gname, "HEAD"))
+    var spages = stored_u64(obs, key_meta(gname, "SIZE")) // PAGE
+    check("staged: the head moved once for the whole commit", shead1 == shead0 + 1, failed)
+    var sdelta = count_rows(obs, key_delta_txid(gname, UInt64(shead1)))
+    check("staged: more page rows than one transaction holds (" + String(sdelta) + " against " + String(ONE_TXN_PAGES) + ")", sdelta > ONE_TXN_PAGES, failed)
+    check("staged: every page has an index row", count_rows(obs, key_prefix(gname, "PIDX")) == Int(spages), failed)
+    check("staged: nothing is left above the head", count_rows(obs, key_delta_txid(gname, UInt64(shead1 + 1))) == 0, failed)
+    check("staged: integrity_check is ok", scalar(lib, dbs, "select count(*) from pragma_integrity_check where integrity_check='ok'") == 1, failed)
+    check("staged: all 2300 rows read back", scalar(lib, dbs, "select count(*) from s where length(v)=3900") == 2300, failed)
+    _ = lib.call["sqlite3_close", Int32](dbs)
+    check("staged: closing folded a staged commit (SHARD holds every page)", count_rows(obs, key_shard_version(gname, UInt64(stored_u64(obs, key_meta(gname, "HEAD"))))) == Int(spages), failed)
+    var dbt = open_db(lib, gname, V, 6)
+    check("staged: a reopened, folded store reads all 2300 rows", scalar(lib, dbt, "select count(*) from s where length(v)=3900") == 2300, failed)
+    _ = lib.call["sqlite3_close", Int32](dbt)
+
+    # a stale writer's big commit stops at the first chunk: nothing is staged, the head stays
+    var dba = open_db(lib, gname, V, 6)
+    check("stale: the old owner opens", run(lib, dba, "pragma locking_mode=exclusive; select 1") == 0, failed)
+    var dbb = open_db(lib, gname, V, 6)
+    check("stale: a new owner opens and raises the fence", run(lib, dbb, "pragma locking_mode=exclusive; select 1") == 0, failed)
+    var shead2 = stored_u64(obs, key_meta(gname, "HEAD"))
+    check("stale: the old owner's big commit is refused", run(lib, dba, "begin; with recursive c(x) as (select 1 union all select x+1 from c where x<2200) insert into s select x+10000, zeroblob(3900) from c; commit") != 0, failed)
+    check("stale: the head did not move", stored_u64(obs, key_meta(gname, "HEAD")) == shead2, failed)
+    check("stale: no page was staged above the head", count_rows(obs, key_delta_txid(gname, UInt64(shead2 + 1))) == 0, failed)
+    _ = lib.call["sqlite3_close", Int32](dba)
+    _ = lib.call["sqlite3_close", Int32](dbb)
+    var tge = Txn(obs)
+    tge.clear_range(obs, key_meta(gname, ""), key_after(key_meta(gname, "")))
+    check("clean up the staged-commit database", tge.commit(obs) == 0, failed)
+    tge.destroy(obs)
+
+    # Another committer's group record. A group staged across databases is implicitly committed
+    # once every intent is durable and its record is written, and any process that finds it must
+    # finish it: opening raises the fence and clears the rows above the head, which would destroy
+    # a commit the protocol says must happen. So a writer's open decides every staging record first.
+    var gone = Txn(obs)
+    gone.clear_range(obs, key_txn_all(), key_after(key_txn_all()))
+    _ = gone.commit(obs)
+    gone.destroy(obs)
+    var g1 = String("mojo-vfs-group")
+    var gA = String("mojo-vfs-abortA")
+    var gB = String("mojo-vfs-abortB")
+    for nm in List[String]([g1, gA, gB]):
+        var tc = Txn(obs)
+        tc.clear_range(obs, key_meta(nm, ""), key_after(key_meta(nm, "")))
+        _ = tc.commit(obs)
+        tc.destroy(obs)
+        var dbc = open_db(lib, nm, V, 6)
+        _ = run(lib, dbc, "pragma journal_mode=memory; pragma locking_mode=exclusive; create table q(id integer primary key); insert into q values (1)")
+        _ = lib.call["sqlite3_close", Int32](dbc)
+
+    # 1. implicitly committed: the record names one participant and its intent is durable
+    var h1 = stored_u64(obs, key_meta(g1, "HEAD"))
+    var s1 = stored_u64(obs, key_meta(g1, "SIZE"))
+    var l1 = stored_u64(obs, key_meta(g1, "LOGN"))
+    var f1 = stored_u64(obs, key_meta(g1, "FENCE"))
+    var ts1 = Txn(obs)
+    var staging = List[UInt8]()
+    staging.append(UInt8(TXN_STAGING))
+    ts1.set(obs, key_txn_status(777), staging)
+    var part1 = List[UInt8]()
+    put_be64(part1, UInt64(h1 + 1))
+    put_be64(part1, UInt64(s1))
+    ts1.set(obs, key_txn_part(777, g1), part1)
+    ts1.set(obs, key_delta(g1, UInt64(h1 + 1), 0), List[UInt8](length=PAGE, fill=UInt8(9)))
+    check("group: stage a committed group (record and one durable intent)", ts1.commit(obs) == 0, failed)
+    ts1.destroy(obs)
+    var hd1 = 0
+    var rc1 = open_rc(lib, g1, V, 6, hd1)
+    check("group: a writer opens over a committed group", rc1 == 0, failed)
+    check("group: its open finished the group: HEAD moved to the staged txid", stored_u64(obs, key_meta(g1, "HEAD")) == h1 + 1, failed)
+    check("group: PIDX/0 points at the staged txid", stored_u64(obs, key_pidx(g1, 0)) == h1 + 1, failed)
+    check("group: SIZE is the size the record carried", stored_u64(obs, key_meta(g1, "SIZE")) == s1, failed)
+    check("group: LOGN grew by the staged pages", stored_u64(obs, key_meta(g1, "LOGN")) == l1 + 1, failed)
+    check("group: the staged page is still there", stored_present(obs, key_delta(g1, UInt64(h1 + 1), 0)), failed)
+    check("group: the record is dropped", count_rows(obs, key_txn_prefix(777)) == 0, failed)
+    check("group: the open raised the fence once", stored_u64(obs, key_meta(g1, "FENCE")) == f1 + 1, failed)
+    if rc1 == 0:
+        _ = lib.call["sqlite3_close", Int32](hd1)
+
+    # 2. aborted: A's intent is durable, B's is missing, so the group can never commit
+    var hA = stored_u64(obs, key_meta(gA, "HEAD"))
+    var sA = stored_u64(obs, key_meta(gA, "SIZE"))
+    var fA = stored_u64(obs, key_meta(gA, "FENCE"))
+    var hB = stored_u64(obs, key_meta(gB, "HEAD"))
+    var sB = stored_u64(obs, key_meta(gB, "SIZE"))
+    var fB = stored_u64(obs, key_meta(gB, "FENCE"))
+    var ts2 = Txn(obs)
+    ts2.set(obs, key_txn_status(778), staging)
+    var partA = List[UInt8]()
+    put_be64(partA, UInt64(hA + 1))
+    put_be64(partA, UInt64(sA))
+    ts2.set(obs, key_txn_part(778, gA), partA)
+    var partB = List[UInt8]()
+    put_be64(partB, UInt64(hB + 1))
+    put_be64(partB, UInt64(sB))
+    ts2.set(obs, key_txn_part(778, gB), partB)
+    ts2.set(obs, key_delta(gA, UInt64(hA + 1), 0), List[UInt8](length=PAGE, fill=UInt8(9)))
+    check("group: stage an aborted group (A's intent durable, B's missing)", ts2.commit(obs) == 0, failed)
+    ts2.destroy(obs)
+    var hd2 = 0
+    var rc2 = open_rc(lib, gA, V, 6, hd2)
+    check("group: a writer opens over an aborted group", rc2 == 0, failed)
+    check("group: A's head did not move", stored_u64(obs, key_meta(gA, "HEAD")) == hA, failed)
+    check("group: B's head did not move", stored_u64(obs, key_meta(gB, "HEAD")) == hB, failed)
+    check("group: A's staged page is cleared", not stored_present(obs, key_delta(gA, UInt64(hA + 1), 0)), failed)
+    check("group: the record is dropped", count_rows(obs, key_txn_prefix(778)) == 0, failed)
+    check("group: B, whose intent was missing, has its fence raised", stored_u64(obs, key_meta(gB, "FENCE")) == fB + 1, failed)
+    check("group: A, a healthy participant, has only the open's fence (not the abort's too)", stored_u64(obs, key_meta(gA, "FENCE")) == fA + 1, failed)
+    if rc2 == 0:
+        _ = lib.call["sqlite3_close", Int32](hd2)
+
+    # a reader neither decides a record nor raises a fence
+    var ts3 = Txn(obs)
+    ts3.set(obs, key_txn_status(779), staging)
+    var part3 = List[UInt8]()
+    put_be64(part3, UInt64(h1 + 5))
+    put_be64(part3, UInt64(s1))
+    ts3.set(obs, key_txn_part(779, g1), part3)
+    check("group: stage a record for a reader to leave alone", ts3.commit(obs) == 0, failed)
+    ts3.destroy(obs)
+    var f3 = stored_u64(obs, key_meta(g1, "FENCE"))
+    var hd3 = 0
+    check("group: a reader opens", open_rc(lib, g1, V, 1, hd3) == 0, failed)
+    check("group: and leaves the record and the fence alone", count_rows(obs, key_txn_prefix(779)) > 0 and stored_u64(obs, key_meta(g1, "FENCE")) == f3, failed)
+    _ = lib.call["sqlite3_close", Int32](hd3)
+    var tz = Txn(obs)
+    tz.clear_range(obs, key_txn_all(), key_after(key_txn_all()))
+    for nm in List[String]([g1, gA, gB]):
+        tz.clear_range(obs, key_meta(nm, ""), key_after(key_meta(nm, "")))
+    check("clean up the group databases", tz.commit(obs) == 0, failed)
+    tz.destroy(obs)
+
+    # The fence check of a staging chunk, with no read in the way. Through SQL a stale writer is
+    # stopped by a read's fence check before it reaches a chunk, so write the pages through the file
+    # methods: 2,200 pages need two staging transactions, and each must refuse a stale owner.
+    var sname = String("mojo-vfs-stale-direct")
+    var tsc = Txn(obs)
+    tsc.clear_range(obs, key_meta(sname, ""), key_after(key_meta(sname, "")))
+    _ = tsc.commit(obs)
+    tsc.destroy(obs)
+    var snm = sname.copy()
+    var svfs = lib.call["sqlite3_vfs_find", Int](V.copy().unsafe_ptr())
+    var sold = alloc[UInt8](24)
+    var snew = alloc[UInt8](24)
+    check("stale-direct: the old owner opens", vfs_open(svfs, Int(snm.unsafe_ptr()), Int(sold), 6, 0) == 0, failed)
+    var spage = alloc[UInt8](PAGE)
+    for i in range(PAGE):
+        spage[unsafe_offset=i] = 7
+    var swrote = True
+    for pg in range(2200):
+        if fdb_write(Int(sold), Int(spage), Int32(PAGE), Int64(pg * PAGE)) != 0:
+            swrote = False
+    check("stale-direct: 2,200 pages buffered", swrote, failed)
+    check("stale-direct: a new owner opens and raises the fence", vfs_open(svfs, Int(snm.unsafe_ptr()), Int(snew), 6, 0) == 0, failed)
+    check("stale-direct: the old owner's sync is refused", fdb_sync(Int(sold), 0) != 0, failed)
+    check("stale-direct: the head never moved", stored_u64(obs, key_meta(sname, "HEAD")) == -1, failed)
+    check("stale-direct: no chunk of the refused commit was staged", count_rows(obs, key_delta_txid(sname, 1)) == 0, failed)
+    _ = fdb_close(Int(sold))
+    _ = fdb_close(Int(snew))
+    var tse = Txn(obs)
+    tse.clear_range(obs, key_meta(sname, ""), key_after(key_meta(sname, "")))
+    check("clean up the stale-direct database", tse.commit(obs) == 0, failed)
+    tse.destroy(obs)
 
     # leave nothing behind
     check("the database exists", stored_u64(obs, key_meta(name, "SIZE")) > 0, failed)
