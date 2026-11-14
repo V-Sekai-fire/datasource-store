@@ -92,6 +92,14 @@ struct EdgeResult(Copyable, Movable):
     var key: List[UInt8]
 
 
+@fieldwise_init
+struct RangeResult(Movable):
+    var code: Int32
+    var more: Bool
+    var keys: List[List[UInt8]]
+    var values: List[List[UInt8]]
+
+
 struct Fdb(Movable):
     var lib: OwnedDLHandle
     var path: String
@@ -218,6 +226,44 @@ struct Txn(Movable):
                     key.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=kp)[unsafe_offset=i])
         _ = fdb.lib.call["fdb_future_destroy", Int32](f)
         return EdgeResult(rc, found, key^)
+
+    # Every row of [begin, end) the server sends in one answer, in key order. `more` says there
+    # are rows after the last one returned: call again with begin = that key and `after` True.
+    # Laid out as FDBKeyValue packed to 4: key pointer@0, key length@8, value pointer@12,
+    # value length@20, 24 bytes a row.
+    def range_rows(self, fdb: Fdb, begin: List[UInt8], after: Bool, end: List[UInt8]) raises -> RangeResult:
+        var f = fdb.lib.call["fdb_transaction_get_range", Int](
+            self.tr,
+            Int(begin.unsafe_ptr()), Int32(len(begin)), Int32(1 if after else 0), Int32(1),
+            Int(end.unsafe_ptr()), Int32(len(end)), Int32(0), Int32(1),
+            Int32(0), Int32(0), Int32(-1), Int32(1), Int32(0), Int32(0),
+        )
+        var rc = fdb.lib.call["fdb_future_block_until_ready", Int32](f)
+        if rc == 0:
+            rc = fdb.lib.call["fdb_future_get_error", Int32](f)
+        var keys = List[List[UInt8]]()
+        var values = List[List[UInt8]]()
+        var more = False
+        if rc == 0:
+            var out = _slot()  # kv pointer@0, count@8 (int), more@16 (int)
+            rc = fdb.lib.call["fdb_future_get_keyvalue_array", Int32](f, out, out + 8, out + 16)
+            if rc == 0:
+                more = _rd32(out + 16) != 0
+                var kv = _rd(out)
+                for r in range(_rd32(out + 8)):
+                    var row = kv + r * 24
+                    var kp = _rd(row)
+                    var key = List[UInt8]()
+                    for i in range(_rd32(row + 8)):
+                        key.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=kp)[unsafe_offset=i])
+                    var vp = _rd(row + 12)
+                    var value = List[UInt8]()
+                    for i in range(_rd32(row + 20)):
+                        value.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=vp)[unsafe_offset=i])
+                    keys.append(key^)
+                    values.append(value^)
+        _ = fdb.lib.call["fdb_future_destroy", Int32](f)
+        return RangeResult(rc, more, keys^, values^)
 
     # Mark this transaction batch priority, as a fold's transactions are. Returns the error code.
     def priority_batch(self, fdb: Fdb) raises -> Int32:

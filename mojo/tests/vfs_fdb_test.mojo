@@ -69,6 +69,25 @@ def stored_present(fdb: Fdb, key: List[UInt8]) raises -> Bool:
     return r.present
 
 
+def count_rows(fdb: Fdb, prefix: List[UInt8]) raises -> Int:
+    var t = Txn(fdb)
+    var n = 0
+    var begin = prefix.copy()
+    var after = False
+    var end = key_after(prefix)
+    while True:
+        var r = t.range_rows(fdb, begin, after, end)
+        if r.code != 0 or len(r.keys) == 0:
+            break
+        n += len(r.keys)
+        if not r.more:
+            break
+        begin = r.keys[len(r.keys) - 1].copy()
+        after = True
+    t.destroy(fdb)
+    return n
+
+
 def main() raises:
     var failed = 0
     var cluster = getenv("WEFT_FDB_CLUSTER_FILE")
@@ -249,6 +268,52 @@ def main() raises:
     check("close", fdb_close(fa) == 0, failed)
     check("vfs_delete", vfs_delete(vfs, Int(nm2.unsafe_ptr()), 0) == 0, failed)
     check("delete cleared every key under the name", stored_u64(obs, key_meta(name2, "HEAD")) == -1 and stored_u64(obs, key_meta(name2, "SIZE")) == -1, failed)
+
+    # A fold: the log is as large as the base, so closing pays it. Every page moves to
+    # SHARD/<head>/<pgno>, the marker says how many, and the log rows and the index go.
+    var fname = String("mojo-vfs-fold")
+    var tfc = Txn(obs)
+    tfc.clear_range(obs, key_meta(fname, ""), key_after(key_meta(fname, "")))
+    check("clear the fold database", tfc.commit(obs) == 0, failed)
+    tfc.destroy(obs)
+    var dbf = open_db(lib, fname, V, 6)
+    check("fold: create and fill", run(lib, dbf, "pragma journal_mode=memory; pragma locking_mode=exclusive; create table t(id integer primary key, v text); with recursive c(x) as (select 1 union all select x+1 from c where x<600) insert into t select x, 'row-' || x from c") == 0, failed)
+    check("no shard yet: the fold is owed, not paid", count_rows(obs, key_prefix(fname, "SHARDN")) == 0, failed)
+    _ = lib.call["sqlite3_close", Int32](dbf)
+    var fhead = stored_u64(obs, key_meta(fname, "HEAD"))
+    var npg = stored_u64(obs, key_meta(fname, "SIZE")) // PAGE
+    check("closing paid the fold: SHARDN names the head", stored_u64(obs, key_shardn(fname, UInt64(fhead))) == npg, failed)
+    check("SHARD holds every page", count_rows(obs, key_shard_version(fname, UInt64(fhead))) == npg, failed)
+    check("the index is gone", count_rows(obs, key_prefix(fname, "PIDX")) == 0, failed)
+    check("the log rows are gone", count_rows(obs, key_prefix(fname, "DELTA")) == 0, failed)
+    check("LOGN is back to zero", stored_u64(obs, key_meta(fname, "LOGN")) == 0, failed)
+    var dbg = open_db(lib, fname, V, 6)
+    check("a folded store opens and reads", scalar(lib, dbg, "select count(*) from t") == 600, failed)
+    check("integrity_check is ok on a folded store", scalar(lib, dbg, "select count(*) from pragma_integrity_check where integrity_check='ok'") == 1, failed)
+    check("an update after the fold", run(lib, dbg, "pragma locking_mode=exclusive; update t set v='after-fold' where id=300") == 0, failed)
+    var ahead = stored_u64(obs, key_meta(fname, "HEAD"))
+    var tfd = Txn(obs)
+    var fd_rows = 0
+    var fd_delta = 0
+    for pg in range(Int(npg)):
+        var rr = tfd.get_result(obs, key_delta(fname, UInt64(ahead), UInt32(pg)))
+        if rr.present:
+            fd_rows += 1
+            if len(rr.value) < PAGE and rr.value[0] == 0xD7 and rr.value[1] == 2:
+                fd_delta += 1
+    tfd.destroy(obs)
+    # page 0 changes by a few bytes and goes as a delta over the shard; the leaf the update
+    # rewrote moves more than a fifth of its cells, so it goes whole, as the rule says
+    check("the update wrote rows, and at least one is a delta against the shard", fd_rows >= 2 and fd_delta >= 1, failed)
+    _ = lib.call["sqlite3_close", Int32](dbg)
+    check("the shard stays: a small log does not trip another fold", count_rows(obs, key_shard_version(fname, UInt64(fhead))) == npg, failed)
+    var dbh = open_db(lib, fname, V, 6)
+    check("a delta over a shard reads back", scalar(lib, dbh, "select count(*) from t where v='after-fold'") == 1, failed)
+    _ = lib.call["sqlite3_close", Int32](dbh)
+    var tfe = Txn(obs)
+    tfe.clear_range(obs, key_meta(fname, ""), key_after(key_meta(fname, "")))
+    check("clean up the fold database", tfe.commit(obs) == 0, failed)
+    tfe.destroy(obs)
 
     # leave nothing behind
     check("the database exists", stored_u64(obs, key_meta(name, "SIZE")) > 0, failed)

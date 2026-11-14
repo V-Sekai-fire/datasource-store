@@ -130,6 +130,12 @@ def main() raises:
         pragmas(lib, db)
         check("more rows and a delete", run(lib, db, "insert into t select id+1000, 'late-' || id from t where id <= 40; delete from t where id between 100 and 130") == 0, failed)
         _ = lib.call["sqlite3_close", Int32](db)
+    elif step == "eq-4":
+        # a last small update, left as log rows: PIDX and DELTA over the shard, no fold owed
+        var db = open_db(lib, "eq.db", V)
+        pragmas(lib, db)
+        check("a last small update", run(lib, db, "update t set v='tail' where id=7") == 0, failed)
+        _ = lib.call["sqlite3_close", Int32](db)
     else:
         raise Error("CROSS_STEP is not one of clean, write-m, read-m, read-c")
 

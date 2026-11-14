@@ -83,6 +83,7 @@ struct FileState(Movable):
     var trunc_pages: Int
     var log_pages: Int
     var has_shard: Bool
+    var compact_due: Bool
     var shard_as_of: Int
     var base_pages: Int
     var pidx_row: Int
@@ -103,6 +104,7 @@ struct FileState(Movable):
         self.trunc_pages = -1
         self.log_pages = 0
         self.has_shard = False
+        self.compact_due = False
         self.shard_as_of = 0
         self.base_pages = 0
         self.pidx_row = len(key_pidx(name, 0)) + 8
@@ -449,6 +451,210 @@ def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
     return 0
 
 
+# ── Compaction ────────────────────────────────────────────────────────────────
+#
+# A fold turns the log into a new shard version, as `compact_at` in `fdb_vfs.c` does: every page
+# at the head is written to SHARD/<head>/<pgno>, and one last transaction sets SHARDN/<head>,
+# clears every PIDX and DELTA row and every older shard version, and zeroes LOGN. It is owed when
+# the log is as large as the base, and paid when the file closes. This one reads and writes a
+# window at a time and waits for each; the C keeps four windows' commits in flight.
+
+comptime STAGE_TXN_PAGES = FDB_TXN_LIMIT // DELTA_ROW
+comptime FOLD_WINDOW_PAGES = STAGE_TXN_PAGES // 4
+
+
+def should_compact(f: FileState) -> Bool:
+    return f.log_pages > 0 and f.base_pages <= f.log_pages
+
+
+struct FoldWindow(Movable):
+    var pages: List[List[UInt8]]
+    var present: List[Bool]
+
+    def __init__(out self):
+        self.pages = List[List[UInt8]]()
+        self.present = List[Bool]()
+
+
+def pgno_of_key(key: List[UInt8]) -> Int:
+    var n = len(key)
+    return (Int(key[n - 4]) << 24) | (Int(key[n - 3]) << 16) | (Int(key[n - 2]) << 8) | Int(key[n - 1])
+
+
+# Read a window of pages with the answers a read gives: the page's owner in PIDX, its row in
+# DELTA (rebuilt against its base when it is a delta), else its row in the shard.
+def fold_read_body(fdb: Fdb, t: Txn, f: FileState, lo: Int, hi: Int, mut w: FoldWindow) raises -> Int32:
+    var fc = check_fence(fdb, t, f)
+    if fc != 0:
+        return fc
+    var n = hi - lo
+    w = FoldWindow()
+    var owner = List[Int]()
+    for _ in range(n):
+        w.pages.append(List[UInt8]())
+        w.present.append(False)
+        owner.append(0)
+
+    var begin = key_pidx(f.name, UInt32(lo))
+    var end = key_pidx(f.name, UInt32(hi))
+    var after = False
+    while True:
+        var r = t.range_rows(fdb, begin, after, end)
+        if r.code != 0:
+            return r.code
+        for i in range(len(r.keys)):
+            var pg = pgno_of_key(r.keys[i])
+            if pg >= lo and pg < hi and len(r.values[i]) == 8:
+                owner[pg - lo] = Int(get_be64(r.values[i], 0))
+        if not r.more or len(r.keys) == 0:
+            break
+        begin = r.keys[len(r.keys) - 1].copy()
+        after = True
+
+    if f.has_shard:
+        begin = key_shard(f.name, UInt64(f.shard_as_of), UInt32(lo))
+        end = key_shard(f.name, UInt64(f.shard_as_of), UInt32(hi))
+        after = False
+        while True:
+            var r = t.range_rows(fdb, begin, after, end)
+            if r.code != 0:
+                return r.code
+            for i in range(len(r.keys)):
+                var pg = pgno_of_key(r.keys[i])
+                if pg >= lo and pg < hi and owner[pg - lo] == 0:
+                    var v = r.values[i].copy()
+                    if len(v) > PAGE:
+                        v.resize(PAGE, 0)
+                    w.pages[pg - lo] = v^
+                    w.present[pg - lo] = True
+            if not r.more or len(r.keys) == 0:
+                break
+            begin = r.keys[len(r.keys) - 1].copy()
+            after = True
+
+    for i in range(n):
+        if owner[i] == 0:
+            continue
+        var pgno = lo + i
+        var row = t.get_result(fdb, key_delta(f.name, UInt64(owner[i]), UInt32(pgno)))
+        if row.code != 0:
+            return row.code
+        if not row.present:
+            continue
+        if is_delta(row.value):
+            var kind = Int(row.value[1])
+            var bid = delta_base_id(row.value)
+            var bk = List[UInt8]()
+            if kind == BASE_TXID:
+                bk = key_delta(f.name, bid, UInt32(pgno))
+            elif kind == BASE_SHARD:
+                bk = key_shard(f.name, bid, UInt32(pgno))
+            else:
+                return Int32(2000)
+            var base = t.get_result(fdb, bk)
+            if base.code != 0:
+                return base.code
+            if not base.present or len(base.value) != PAGE:
+                return Int32(2000)  # a base is a full row
+            var page = base.value.copy()
+            if delta_apply(row.value, page) != 0:
+                return Int32(2000)
+            w.pages[i] = page^
+            w.present[i] = True
+        else:
+            var v = row.value.copy()
+            if len(v) > PAGE:
+                v.resize(PAGE, 0)
+            w.pages[i] = v^
+            w.present[i] = True
+    return 0
+
+
+def fold_write_body(fdb: Fdb, t: Txn, f: FileState, as_of: Int, lo: Int, w: FoldWindow) raises -> Int32:
+    _ = t.priority_batch(fdb)
+    var fc = check_fence(fdb, t, f)
+    if fc != 0:
+        return fc
+    for i in range(len(w.pages)):
+        if w.present[i]:
+            t.set(fdb, key_shard(f.name, UInt64(as_of), UInt32(lo + i)), w.pages[i])
+    return 0
+
+
+# Make the new shard version the one a read uses, and drop what it replaced, in one transaction.
+def fold_finish_body(fdb: Fdb, t: Txn, f: FileState, as_of: Int, kept: Int) raises -> Int32:
+    _ = t.priority_batch(fdb)
+    var fc = check_fence(fdb, t, f)
+    if fc != 0:
+        return fc
+    t.set(fdb, key_shardn(f.name, UInt64(as_of)), u64_value(kept))
+    var pidx = key_prefix(f.name, "PIDX")
+    t.clear_range(fdb, pidx, key_after(pidx))
+    var delta = key_prefix(f.name, "DELTA")
+    t.clear_range(fdb, delta, key_after(delta))
+    t.clear_range(fdb, key_shard_version(f.name, 0), key_shard_version(f.name, UInt64(as_of)))
+    t.clear_range(fdb, key_shardn(f.name, 0), key_shardn(f.name, UInt64(as_of)))
+    t.set(fdb, key_meta(f.name, "LOGN"), u64_value(0))
+    return 0
+
+
+def do_compact(mut ctx: Ctx, idx: Int) raises -> Int32:
+    ref fdb = _fdb(ctx.fdb_addr)[]
+    ref f = ctx.files[idx]
+    var as_of = f.head
+    var npages = (f.size + PAGE - 1) // PAGE
+    if npages == 0:
+        return 0
+    var window = FOLD_WINDOW_PAGES
+    if window > npages:
+        window = npages
+    var kept = 0
+    var lo = 0
+    while lo < npages:
+        var hi = lo + window
+        if hi > npages:
+            hi = npages
+        var w = FoldWindow()
+        while True:
+            var t = Txn(fdb)
+            var code = fold_read_body(fdb, t, f, lo, hi, w)
+            var r = settle(fdb, t, code, False, Int32(SQLITE_IOERR_READ))
+            if r == -1:
+                continue
+            if r != 0:
+                return r
+            break
+        while True:
+            var t = Txn(fdb)
+            var code = fold_write_body(fdb, t, f, as_of, lo, w)
+            var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+            if r == -1:
+                continue
+            if r != 0:
+                return r
+            break
+        for i in range(len(w.present)):
+            if w.present[i]:
+                kept += 1
+        lo = hi
+    while True:
+        var t = Txn(fdb)
+        var code = fold_finish_body(fdb, t, f, as_of, kept)
+        var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+        if r == -1:
+            continue
+        if r != 0:
+            return r
+        break
+    f.has_shard = True
+    f.shard_as_of = as_of
+    f.base_pages = kept
+    f.log_pages = 0
+    # The fold deleted every log row and the old shard, which is every base this handle knew.
+    f.bases = Dict[Int, BaseEntry]()
+    return 0
+
+
 def do_flush(mut ctx: Ctx, idx: Int) raises -> Int32:
     ref fdb = _fdb(ctx.fdb_addr)[]
     ref f = ctx.files[idx]
@@ -474,6 +680,9 @@ def do_flush(mut ctx: Ctx, idx: Int) raises -> Int32:
         f.log_pages += len(f.pgnos)
         f.trunc_pages = -1
         f.clear_dirty()
+        # A fold is noted, not done, on the commit that trips the ratio: it is paid at close.
+        if should_compact(f):
+            f.compact_due = True
         return 0
 
 
@@ -487,6 +696,9 @@ def fdb_close(file: Int) abi("C") -> Int32:
     try:
         var idx = peek64(file + 16)
         var rc = do_flush(_file_ctx(file)[], idx)
+        if rc == 0 and _file_ctx(file)[].files[idx].compact_due:
+            _file_ctx(file)[].files[idx].compact_due = False
+            rc = do_compact(_file_ctx(file)[], idx)
         _file_ctx(file)[].files[idx].clear_dirty()
         return rc
     except:
