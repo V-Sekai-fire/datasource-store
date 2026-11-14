@@ -26,7 +26,7 @@ BUILD=${BUILD:-build}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb mojo-keys backup-fresh spec tla'
+ALL='deps build surface mojo-surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-fdb mojo-keys backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -117,6 +117,13 @@ stage_build() {
 # serializable. Needs no cluster: it reads the built library's undefined symbols.
 stage_surface() {
 	./check_surface.sh "$BUILD"
+}
+
+# The Mojo side of the same question: the exported entry points against `mojo/vfs_fdb.sigs`.
+# Reads the source, so it needs no build and no Mojo toolchain. The self-test runs first so a
+# gate that cannot fail does not pass quietly.
+stage_mojo_surface() {
+	./check_mojo_surface.sh --self-test && ./check_mojo_surface.sh
 }
 
 # A handoff copies nothing. The reader is a different process with no local file, so this
