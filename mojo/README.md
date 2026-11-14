@@ -27,7 +27,9 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | 2a | Page delta codec | `fdb_vfs.c` "Page deltas" block, `spec/PageDelta.lean` | Done. `src/page_delta.mojo` |
 | 2b | Read-ahead scorer, compaction trigger | `ra_depth`, `should_compact` in `fdb_vfs.c` | Done. `src/read_ahead.mojo` |
 | 2c | Commit models | `spec/GroupCommit.lean` and the rest | Not started |
-| 3 | `weft_fdb_vfs` (SQLite VFS over FoundationDB) | `fdb_vfs.c` | Not started. Needs an FDB C client and a `sqlite3_vfs` binding through Mojo's C interop |
+| 3a | SQLite VFS in Mojo, over an in-memory store | `sqlite3_vfs` and `sqlite3_io_methods` of `fdb_vfs.c` | Done. `src/vfs_mem.mojo` |
+| 3b | FoundationDB client binding (network thread, transactions) | `fdb_c.h` use in `fdb_vfs.c` | Not started |
+| 3c | The two joined: pages in FoundationDB through the Mojo VFS | `fdb_vfs.c` | Not started |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
 
@@ -77,6 +79,22 @@ four fields they read and compiles the blocks cut out of `fdb_vfs.c`.
   8 to 9, step 2 to 3, full depth 10 to 11, and a strict compaction trigger. The generators use the
   model's own numbers, not the port's constants; with the port's constants the gap and decay
   mutants slipped past the witness and only parity saw them.
+
+## Slice 3a: a SQLite VFS written in Mojo
+
+`src/vfs_mem.mojo` registers a VFS with real SQLite and keeps the files in a `MemStore`; slice 3b
+replaces that store with FoundationDB. SQLite is loaded from the pixi environment (`sqlite` in
+`pixi.toml`), and the C function tables are built in raw memory with Mojo `abi("C")` functions as
+the entries; no C shim and no shared library, and it runs under `mojo run`.
+
+- `pixi run vfs-mem`: SQLite creates a table, inserts 1,000 rows, updates, passes `integrity_check`,
+  vacuums (through `xTruncate`), is closed, and a second connection sees the same rows, with no
+  local file made. Then the file methods are called directly for what SQL does not reach: a short
+  read, truncate, delete, and open without CREATE.
+- Mutants of the VFS, each caught: a write that drops its last byte, truncate doing nothing, delete
+  keeping the file, no short-read error, and open ignoring CREATE.
+- Not covered yet: locking (all no-ops, as in `fdb_vfs.c`), `xFileControl`, the dirty-page buffer,
+  and everything that makes the store FoundationDB: the fence, the log, the fold.
 
 ## Differences from the C header
 
