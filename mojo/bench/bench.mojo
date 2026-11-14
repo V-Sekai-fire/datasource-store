@@ -111,12 +111,16 @@ def main() raises:
             if prc != 0:
                 raise Error("prepare rc " + String(prc))
             var h = stmt[unsafe_offset=0]
+            # Resolved once. `lib.call` looks the symbol up on every call, and a feed takes 21
+            # steps; a dtrace profile put a quarter of this driver's time in dyld doing that.
+            var f_step = lib.get_function[Int32]("sqlite3_step")
+            var f_reset = lib.get_function[Int32]("sqlite3_reset")
             for i in range(iters):
                 if per > 1 and i % per == 0:
                     run(lib, db, "BEGIN")
-                while lib.call["sqlite3_step", Int32](h) == 100:
+                while f_step(h) == 100:
                     pass
-                if lib.call["sqlite3_reset", Int32](h) != 0:
+                if f_reset(h) != 0:
                     raise Error("step failed")
                 if per > 1 and (i % per == per - 1 or i == iters - 1):
                     run(lib, db, "COMMIT")

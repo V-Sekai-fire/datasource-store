@@ -199,8 +199,13 @@ that wait a Mojo run that followed a C run read 2.5 s, which was the wipe and no
 `bench/` runs the $12-server challenge's operations on plain SQLite, the C VFS and the Mojo VFS
 (`BENCH=1 sh tests/fdb_container.sh`). Measured in the container on one single-node in-memory
 FoundationDB: single commits are equal, batched writes are 93 to 98 percent of the C's, and a
-feed read after the writes is about 75 percent of it, for a reason not found yet. The fold at
-close is within about 5 percent of the C's (table above).
+feed read after the writes was about 75 percent of it because the Mojo driver, not the VFS, was
+slower: it looked up `sqlite3_step` and `sqlite3_reset` by name on every call, which a dtrace
+profile on the Mac put at 987 of 3,975 samples in dyld (the C run took 2,737 samples in all). With
+the symbols resolved once the feed after the writes runs at 68,000 to 71,400 reads a second against
+52,000 before, and the C driver's 74,500 to 76,500; SQLite's own time still differs by about a tenth
+between runs, because `random()` makes each run's data different. Read rows from before this fix
+include that driver cost. The fold at close is within about 5 percent of the C's (table above).
 
 ## Slice 3c-3: big commits and other committers
 
