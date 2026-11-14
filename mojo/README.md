@@ -32,7 +32,8 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | 3c-1 | The two joined, first cut: open, read, write, commit, fence, truncate, delete | `fdb_vfs.c` | Done. `src/vfs_fdb.mojo` |
 | 3c-2 | Shard reads, delta writes, and the fold at close | `fdb_vfs.c` | Done. Same bytes as the C: `tests/cross.sh` |
 | 3c-3 | Staged commits above one transaction, and recovery of group commits another committer left staging | `fdb_vfs.c` | Done. Same bytes as the C for 2,300-page commits: `tests/cross.sh` |
-| 3c-4 | Read-ahead, starting a cross-database group, readers that follow the head | `fdb_vfs.c` | Not started |
+| 3c-4 | Starting a cross-database group: `weft_txn_begin`, `join`, `commit`, `abort` | `fdb_vfs.c` | Done. The C reads what a Mojo group wrote: `tests/cross.sh` |
+| 3c-5 | Read-ahead, readers that follow the head | `fdb_vfs.c` | Not started |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
 
@@ -219,8 +220,15 @@ at `weft/txn/<id>`. After that record lands the group is committed, whether or n
 survives. So a writer's open decides every staging record before it raises the fence or clears the
 rows above the head, as `recover_one` does in the C: all intents durable finishes the group, a
 missing intent aborts it and raises the fence of the participant that lacked one, and no other. A
-reader skips this. This VFS decides groups; it cannot start one. A group participant must stage in
-one transaction in the C, so a group never takes the chunked path.
+reader skips this. A group participant must stage in one transaction, as in the C, so a group
+never takes the chunked path: a member with more pages than that is refused at its sync.
+
+This VFS starts groups too (slice 3c-4). `weft_txn_begin` takes the next id from a counter in the
+store, `weft_txn_join` marks a database so its syncs stage instead of committing, and
+`weft_txn_commit` writes the record in one transaction that also reads every member's fence, then
+moves each head and drops the record. An abort writes nothing: the staged pages stay unreachable
+and the next open clears them. One difference from the C: it holds a lock from begin to commit, so
+a second begin waits; this VFS has none to hold, and a second begin answers `SQLITE_BUSY`.
 
 ## SQLite's own test corpus
 

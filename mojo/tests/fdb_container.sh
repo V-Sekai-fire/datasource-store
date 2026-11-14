@@ -66,6 +66,11 @@ if [ -n "${MUTANTS:-}" ]; then
 	mutant vfs-fdb $V "recovery: an abort fences a healthy participant" sed -i 's/    if fence_it:/    if True:/' $V
 	mutant vfs-fdb $V "recovery: a decided record is not dropped" sed -i 's/t.clear_range(fdb, pre, key_after(pre))\n    return 0\n\n\ndef recover_one/XX/;/^def drop_record_body/,/return 0/{s/    t.clear_range(fdb, pre, key_after(pre))/    pass/}' $V
 	mutant vfs-fdb $V "recovery: a writer's open never runs it" sed -i 's/        var rec = recover_groups(fdb)/        var rec = Int32(0)/' $V
+	mutant vfs-fdb $V "group: a member's sync commits instead of staging" sed -i 's/    if ctx.files\[idx\].group_txnid != 0:/    if False:/' $V
+	mutant vfs-fdb $V "group: the record skips the members' fences" sed -i 's/        var fc = check_fence(fdb, t, c.files\[c.g_files\[i\]\])/        var fc = Int32(0)/' $V
+	mutant vfs-fdb $V "group: no head is moved" sed -i 's/        var code = head_body(fdb, t, f, staged)/        var code = Int32(0)/' $V
+	mutant vfs-fdb $V "group: the record is never dropped" sed -i 's/            var code = drop_record_body(fdb, t, txnid)/            var code = Int32(0)/' $V
+	mutant vfs-fdb $V "group: an abort leaves its members flagged" perl -0pi -e 's/(def weft_txn_abort.*?)release_group\(c\)/$1pass/s' $V
 	mutant vfs-fdb $V "staging: the last chunk is never written" sed -i 's/            lo += STAGE_TXN_PAGES/            lo += 2 * STAGE_TXN_PAGES/' $V
 	mutant vfs-fdb $V "staging: a chunk does not check the fence" perl -0pi -e 's/(def delta_body.*?\n)    var fc = check_fence\(fdb, t, f\)\n    if fc != 0:\n        return fc\n/$1/s' $V
 	cp /tmp/fdb_client.orig src/fdb_client.mojo

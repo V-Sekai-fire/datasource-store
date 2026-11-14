@@ -52,6 +52,15 @@ expect "C reads Mojo's edit" "$out" "mojo-edit"
 out=$(c_sql "$PRAGMAS select count(*) from pragma_integrity_check where integrity_check='ok';" cross-c.db | tail -1)
 expect "C's integrity_check passes on a store both wrote" "$out" "1"
 
+# Mojo starts a group commit across two databases; the C reads both and finds both committed
+mojo_step group-m
+out=$(c_sql "$PRAGMAS select count(*), sum(id) from t;" cross-g1.db | tail -1)
+expect "C reads the first database of Mojo's group commit" "$out" "$(printf '800\t320400')"
+out=$(c_sql "$PRAGMAS select count(*), sum(id) from t;" cross-g2.db | tail -1)
+expect "C reads the second database of Mojo's group commit" "$out" "$(printf '800\t320400')"
+out=$(c_sql "$PRAGMAS select count(*) from pragma_integrity_check where integrity_check='ok';" cross-g1.db | tail -1)
+expect "C's integrity_check passes on a group-committed store" "$out" "1"
+
 # Bit equality. The same three sessions through the C VFS and then the Mojo VFS, each from an
 # empty store, with fdbcli dumping every key and value in between. The two dumps must be the same
 # bytes: the fence, the commit ids, which pages are deltas and what each delta says.

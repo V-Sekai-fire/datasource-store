@@ -77,12 +77,12 @@ def main() raises:
         cluster = "/etc/foundationdb/fdb.cluster"
     var lib = open_sqlite()
     var V = String("weft_mojo_fdb")
-    _ = register_fdb(lib, V, cluster, False)
+    var ctx = register_fdb(lib, V, cluster, False)
 
     if step == "clean":
         var obs = Fdb(cluster)
         var t = Txn(obs)
-        for name in List[String](["cross-m.db", "cross-c.db", "eq.db"]):
+        for name in List[String](["cross-m.db", "cross-c.db", "eq.db", "cross-g1.db", "cross-g2.db"]):
             t.clear_range(obs, key_meta(name, ""), key_after(key_meta(name, "")))
         check("clear both databases", t.commit(obs) == 0, failed)
         t.destroy(obs)
@@ -93,6 +93,20 @@ def main() raises:
         check("insert 1500 rows", run(lib, db, "with recursive c(x) as (select 1 union all select x+1 from c where x<1500) insert into t select x, 'm-' || x from c") == 0, failed)
         check("update a few rows, as a delta commit", run(lib, db, "update t set v='m-updated' where id % 300 = 0") == 0, failed)
         _ = lib.call["sqlite3_close", Int32](db)
+    elif step == "group-m":
+        # a group commit across two databases, started here; the C reads both afterwards
+        var d1 = open_db(lib, "cross-g1.db", V)
+        var d2 = open_db(lib, "cross-g2.db", V)
+        pragmas(lib, d1)
+        pragmas(lib, d2)
+        check("create the two tables", run(lib, d1, "create table t(id integer primary key, v text)") == 0 and run(lib, d2, "create table t(id integer primary key, v text)") == 0, failed)
+        var gid = 0
+        check("begin a group", weft_txn_begin(ctx, gid) == 0, failed)
+        check("join both", weft_txn_join(lib, ctx, d1, gid) == 0 and weft_txn_join(lib, ctx, d2, gid) == 0, failed)
+        check("write 800 rows to each", run(lib, d1, "with recursive c(x) as (select 1 union all select x+1 from c where x<800) insert into t select x, 'g1-' || x from c") == 0 and run(lib, d2, "with recursive c(x) as (select 1 union all select x+1 from c where x<800) insert into t select x, 'g2-' || x from c") == 0, failed)
+        check("commit the group", weft_txn_commit(ctx, gid) == 0, failed)
+        _ = lib.call["sqlite3_close", Int32](d1)
+        _ = lib.call["sqlite3_close", Int32](d2)
     elif step == "read-m":
         # the C read this database, appended 500 rows, and folded it into a shard on close
         var db = open_db(lib, "cross-m.db", V)

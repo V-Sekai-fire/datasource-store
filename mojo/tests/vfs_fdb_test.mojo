@@ -504,6 +504,118 @@ def main() raises:
     check("clean up the stale-direct database", tse.commit(obs) == 0, failed)
     tse.destroy(obs)
 
+    # A group commit started here, across two databases. Each statement's sync stages its pages
+    # under a txid no read can reach; the commit writes a record, then moves both heads together.
+    var gone2 = Txn(obs)
+    gone2.clear_range(obs, key_txn_all(), key_after(key_txn_all()))
+    _ = gone2.commit(obs)
+    gone2.destroy(obs)
+    var ga = String("mojo-vfs-grpA")
+    var gb = String("mojo-vfs-grpB")
+    for nm in List[String]([ga, gb]):
+        var tc = Txn(obs)
+        tc.clear_range(obs, key_meta(nm, ""), key_after(key_meta(nm, "")))
+        _ = tc.commit(obs)
+        tc.destroy(obs)
+        var dbc = open_db(lib, nm, V, 6)
+        _ = run(lib, dbc, "pragma journal_mode=memory; pragma locking_mode=exclusive; create table q(id integer primary key); insert into q values (1)")
+        _ = lib.call["sqlite3_close", Int32](dbc)
+    var gda = open_db(lib, ga, V, 6)
+    var gdb = open_db(lib, gb, V, 6)
+    _ = run(lib, gda, "pragma locking_mode=exclusive; select 1")
+    _ = run(lib, gdb, "pragma locking_mode=exclusive; select 1")
+    var ha0 = stored_u64(obs, key_meta(ga, "HEAD"))
+    var hb0 = stored_u64(obs, key_meta(gb, "HEAD"))
+    var gid = 0
+    var gdummy = 0
+    check("group: begin", weft_txn_begin(ctx, gid) == 0 and gid > 0, failed)
+    check("group: a second begin while one is open is refused", weft_txn_begin(ctx, gdummy) == Int32(SQLITE_BUSY), failed)
+    check("group: join A", weft_txn_join(lib, ctx, gda, gid) == 0, failed)
+    check("group: join B", weft_txn_join(lib, ctx, gdb, gid) == 0, failed)
+    check("group: joining under another id is refused", weft_txn_join(lib, ctx, gda, gid + 1) == Int32(SQLITE_MISUSE), failed)
+    check("group: write A", run(lib, gda, "insert into q values (2)") == 0, failed)
+    check("group: write B", run(lib, gdb, "insert into q values (2)") == 0, failed)
+    check("group: a sync staged and did not commit: A's head stays", stored_u64(obs, key_meta(ga, "HEAD")) == ha0, failed)
+    check("group: B's head stays", stored_u64(obs, key_meta(gb, "HEAD")) == hb0, failed)
+    check("group: A's pages are staged above its head", count_rows(obs, key_delta_txid(ga, UInt64(ha0 + 1))) > 0, failed)
+    var hd = 0
+    check("group: a reader opens mid-group", open_rc(lib, ga, V, 1, hd) == 0, failed)
+    check("group: and does not see the staged row", scalar(lib, hd, "select count(*) from q") == 1, failed)
+    _ = lib.call["sqlite3_close", Int32](hd)
+    check("group: commit", weft_txn_commit(ctx, gid) == 0, failed)
+    check("group: A's head moved", stored_u64(obs, key_meta(ga, "HEAD")) == ha0 + 1, failed)
+    check("group: B's head moved", stored_u64(obs, key_meta(gb, "HEAD")) == hb0 + 1, failed)
+    check("group: the record is dropped", count_rows(obs, key_txn_prefix(UInt64(gid))) == 0, failed)
+    check("group: the connection sees its own rows", scalar(lib, gda, "select count(*) from q") == 2, failed)
+    var hr = 0
+    check("group: a new reader opens", open_rc(lib, ga, V, 1, hr) == 0, failed)
+    check("group: and sees the committed row in A", scalar(lib, hr, "select count(*) from q") == 2, failed)
+    _ = lib.call["sqlite3_close", Int32](hr)
+    var hr2 = 0
+    check("group: and in B", open_rc(lib, gb, V, 1, hr2) == 0 and scalar(lib, hr2, "select count(*) from q") == 2, failed)
+    _ = lib.call["sqlite3_close", Int32](hr2)
+    check("group: after commit a sync commits again", run(lib, gda, "insert into q values (3)") == 0 and stored_u64(obs, key_meta(ga, "HEAD")) == ha0 + 2, failed)
+
+    # abort: nothing was recorded, the staged pages are unreachable, and the next open clears them
+    var ha1 = stored_u64(obs, key_meta(ga, "HEAD"))
+    var gid2 = 0
+    check("group: begin again", weft_txn_begin(ctx, gid2) == 0, failed)
+    check("group: join A for an abort", weft_txn_join(lib, ctx, gda, gid2) == 0, failed)
+    check("group: write A", run(lib, gda, "insert into q values (4)") == 0, failed)
+    check("group: abort", weft_txn_abort(ctx, gid2) == 0, failed)
+    check("group: A's head did not move", stored_u64(obs, key_meta(ga, "HEAD")) == ha1, failed)
+    check("group: no record was written", count_rows(obs, key_txn_prefix(UInt64(gid2))) == 0, failed)
+    check("group: the staged pages are still above the head, unreachable", count_rows(obs, key_delta_txid(ga, UInt64(ha1 + 1))) > 0, failed)
+    # As in the C, an abort does not roll back what SQLite was told was committed: the member's
+    # buffered pages stay and its next sync commits them, in the ordinary way.
+    check("group: the member's next sync commits its buffered row", run(lib, gda, "insert into q values (6)") == 0 and stored_u64(obs, key_meta(ga, "HEAD")) == ha1 + 1, failed)
+    _ = lib.call["sqlite3_close", Int32](gda)
+    _ = lib.call["sqlite3_close", Int32](gdb)
+    var hc = 0
+    check("group: reopen", open_rc(lib, ga, V, 6, hc) == 0, failed)
+    check("group: the rows the abort left are there", scalar(lib, hc, "select count(*) from q where id in (4, 6)") == 2, failed)
+    _ = lib.call["sqlite3_close", Int32](hc)
+
+    # a participant that lost ownership while staging stops the whole group before any record
+    var dba2 = open_db(lib, ga, V, 6)
+    var dbb2 = open_db(lib, gb, V, 6)
+    _ = run(lib, dba2, "pragma locking_mode=exclusive; select 1")
+    _ = run(lib, dbb2, "pragma locking_mode=exclusive; select 1")
+    var ha2 = stored_u64(obs, key_meta(ga, "HEAD"))
+    var hb2 = stored_u64(obs, key_meta(gb, "HEAD"))
+    var gid3 = 0
+    _ = weft_txn_begin(ctx, gid3)
+    _ = weft_txn_join(lib, ctx, dba2, gid3)
+    _ = weft_txn_join(lib, ctx, dbb2, gid3)
+    _ = run(lib, dba2, "insert into q values (5)")
+    _ = run(lib, dbb2, "insert into q values (5)")
+    var hsteal = 0
+    _ = open_rc(lib, gb, V, 6, hsteal)  # a new owner of B raises its fence
+    check("group: a commit with a stale participant is refused", weft_txn_commit(ctx, gid3) != 0, failed)
+    check("group: no record was written", count_rows(obs, key_txn_prefix(UInt64(gid3))) == 0, failed)
+    check("group: A's head did not move", stored_u64(obs, key_meta(ga, "HEAD")) == ha2, failed)
+    check("group: B's head did not move", stored_u64(obs, key_meta(gb, "HEAD")) == hb2, failed)
+    _ = weft_txn_abort(ctx, gid3)
+    _ = lib.call["sqlite3_close", Int32](dba2)
+    _ = lib.call["sqlite3_close", Int32](dbb2)
+    _ = lib.call["sqlite3_close", Int32](hsteal)
+
+    # a participant must stage in one transaction: more pages than that is refused at the sync
+    var dbbig = open_db(lib, ga, V, 6)
+    _ = run(lib, dbbig, "pragma locking_mode=exclusive; select 1")
+    var gid4 = 0
+    _ = weft_txn_begin(ctx, gid4)
+    _ = weft_txn_join(lib, ctx, dbbig, gid4)
+    check("group: a participant above one transaction's pages is refused", run(lib, dbbig, "create table big(id integer primary key, v blob); with recursive c(x) as (select 1 union all select x+1 from c where x<2300) insert into big select x, zeroblob(3900) from c") != 0, failed)
+    _ = weft_txn_abort(ctx, gid4)
+    _ = lib.call["sqlite3_close", Int32](dbbig)
+    var tgz = Txn(obs)
+    tgz.clear_range(obs, key_txn_all(), key_after(key_txn_all()))
+    for nm in List[String]([ga, gb]):
+        tgz.clear_range(obs, key_meta(nm, ""), key_after(key_meta(nm, "")))
+    check("clean up the group-commit databases", tgz.commit(obs) == 0, failed)
+    tgz.destroy(obs)
+
     # leave nothing behind
     check("the database exists", stored_u64(obs, key_meta(name, "SIZE")) > 0, failed)
     var tdel = Txn(obs)
