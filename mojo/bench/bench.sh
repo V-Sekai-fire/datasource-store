@@ -19,7 +19,9 @@ CF=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 OUT=${OUT:-/tmp/bench.tsv}
 sh bench/make_plan.sh > /tmp/plan.txt
 
-wipe() { "$FDBCLI" -C "$CF" --exec 'writemode on; clearrange "" \xff' >/dev/null; }
+# A wipe of a large store leaves the storage server busy for a while, which lands on the next
+# run, so wait for it.
+wipe() { "$FDBCLI" -C "$CF" --exec 'writemode on; clearrange "" \xff' >/dev/null; sleep ${WIPE_SETTLE:-15}; }
 WAL="pragma journal_mode=wal; pragma synchronous=normal; pragma cache_size=-32768"
 SAME="pragma journal_mode=memory; pragma locking_mode=exclusive; pragma synchronous=full; pragma cache_size=-32768"
 VFSP="pragma journal_mode=memory; pragma locking_mode=exclusive; pragma cache_size=-32768"
@@ -34,12 +36,12 @@ echo "pure sqlite, VFS pragmas (C driver)"
 echo "pure sqlite, VFS pragmas (Mojo driver)"
 ./build/bench /tmp/plan.txt /tmp/b-same2.db unix "$SAME" "3 pure, as the VFSs (Mojo driver)" >> "$OUT"
 fi
-if [ -z "${ONLY:-}" ] || [ "$ONLY" = c ]; then
+if [ -z "${ONLY:-}" ] || [ "$ONLY" = c ] || [ "$ONLY" = both ]; then
 echo "C VFS"
 wipe
 ./build/bench_c /tmp/plan.txt bench.db weft_fdb "$VFSP" "4 C VFS over FoundationDB" >> "$OUT"
 fi
-if [ -z "${ONLY:-}" ] || [ "$ONLY" = mojo ]; then
+if [ -z "${ONLY:-}" ] || [ "$ONLY" = mojo ] || [ "$ONLY" = both ]; then
 echo "Mojo VFS"
 wipe
 ./build/bench /tmp/plan.txt bench.db weft_mojo_fdb "$VFSP" "5 Mojo VFS over FoundationDB" >> "$OUT"
@@ -73,4 +75,6 @@ END {
 	for (i=1;i<=m;i++) printf "  %s\n", labs[i]
 }' "$OUT"
 
-[ -z "${ONLY:-}" ] || grep PROFILE "$OUT" || true
+echo "== close, which pays the owed fold (seconds)"
+awk -F'\t' '$2 ~ /^close/ { printf "  %-40s %s\n", $1, $4 }' "$OUT"
+[ -z "${ONLY:-}" ] || grep PROF "$OUT" || true

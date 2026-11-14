@@ -128,4 +128,8 @@ def main() raises:
     var p = scalar(lib, db, "select count(*) from posts")
     var l = scalar(lib, db, "select count(*) from likes")
     print(label, "rows", String(u) + "/" + String(p) + "/" + String(l), sep="\t")
+    # closing pays a fold that is owed: the log has grown as large as the base
+    var tc = perf_counter_ns()
     _ = lib.call["sqlite3_close", Int32](db)
+    var dc = Float64(perf_counter_ns() - tc) * 1e-9
+    print(label, "close (pays the owed fold)", 1, dc, 1.0 / dc, dc * 1e6, sep="\t")
