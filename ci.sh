@@ -319,7 +319,8 @@ stage_vfs_ext() {
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
-# The Mojo ports: the key layout, the page delta codec, and the read-ahead scorer. `fdb_keys.h` is pure, which is why it was split out: this needs
+# The Mojo ports: the key layout, the page delta codec, the read-ahead scorer, and the VFS
+# skeleton (SQLite running on a Mojo VFS over an in-memory store). `fdb_keys.h` is pure, which is why it was split out: this needs
 # neither FoundationDB nor SQLite. The real C is compiled as the oracle (the header, and the
 # blocks cut out of fdb_vfs.c) and diffed against the Mojo port, then the
 # contract-witness-mojo gates run their properties and paired planted-false controls. The ladder is cloned at WITNESS_MOJO_REV, so a change
@@ -346,6 +347,7 @@ stage_mojo_keys() {
 	pixi run mojo run -I src -I "$wm/src" tests/keys_witness.mojo
 	pixi run mojo run -I src -I "$wm/src" tests/delta_witness.mojo
 	pixi run mojo run -I src -I "$wm/src" tests/readahead_witness.mojo
+	pixi run vfs-mem
 }
 # The probe weftspun-fdb's backup checks read, run against its own controls before a machine
 # arms it, so a regression fails here rather than leaving a production check critical.

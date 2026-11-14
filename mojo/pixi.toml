@@ -6,6 +6,7 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [dependencies]
 mojo = "==1.1.0"
+sqlite = ">=3.45"
 
 [tasks]
 # The witness ladder lives in V-Sekai-fire/contract-witness-mojo. In the workspace it sits
@@ -13,5 +14,6 @@ mojo = "==1.1.0"
 keys-witness = "mojo run -I src -I ../../witness-mojo/src tests/keys_witness.mojo"
 delta-witness = "mojo run -I src -I ../../witness-mojo/src tests/delta_witness.mojo"
 readahead-witness = "mojo run -I src -I ../../witness-mojo/src tests/readahead_witness.mojo"
+vfs-mem = "mojo run -I src tests/vfs_mem_test.mojo"
 parity = "sh tests/parity.sh"
-test = { depends-on = ["parity", "keys-witness", "delta-witness", "readahead-witness"] }
+test = { depends-on = ["parity", "keys-witness", "delta-witness", "readahead-witness", "vfs-mem"] }
