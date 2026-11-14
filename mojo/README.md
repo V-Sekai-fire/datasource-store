@@ -24,7 +24,9 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 |---|-------|----------|--------|
 | 1 | Key layout | `fdb_keys.h` | Done. `src/fdb_keys.mojo` |
 | 1 | Key layout witness | `keys-witness/keys_test.cc` | Done. `tests/keys_witness.mojo` replaced it, and witness-cpp and doctest with it |
-| 2 | Page-delta, read-ahead and commit models | `spec/*.lean` checked against `fdb_vfs.c` | Not started |
+| 2a | Page delta codec | `fdb_vfs.c` "Page deltas" block, `spec/PageDelta.lean` | Done. `src/page_delta.mojo` |
+| 2b | Read-ahead scorer, compaction trigger | `ra_depth`, `should_compact`, `spec/ReadAhead.lean` | Not started |
+| 2c | Commit models | `spec/GroupCommit.lean` and the rest | Not started |
 | 3 | `weft_fdb_vfs` (SQLite VFS over FoundationDB) | `fdb_vfs.c` | Not started. Needs an FDB C client and a `sqlite3_vfs` binding through Mojo's C interop |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
@@ -41,6 +43,21 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 
 Both were run against two mutants of the port (little-endian `put_be32`; a `key_after`
 that keeps trailing `0xFF`). Both mutants fail the gate and the parity diff.
+
+## Slice 2a: the page delta codec
+
+`delta_encode`, `delta_apply`, `is_delta` and `delta_base_id` are `static` inside `fdb_vfs.c`, which
+needs FoundationDB and SQLite headers to compile. `tests/parity.sh` cuts the block out of that
+file with `awk` and compiles it alone (`tests/oracle_delta.c`), so the oracle is the shipping text
+and the C is not touched. If the block moves or `PAGE` changes, the script stops.
+
+- `pixi run delta-witness`: four properties and four planted-false controls (round trip with id
+  and kind, the bare header for an unchanged page, a cut delta is whole only on a run boundary,
+  a run is taken iff it fits the page and its bytes are present).
+- Parity: 400 generated pages, 1,543 lines (encoding, header fields, apply, and apply of a
+  one-byte-short delta), identical to the C.
+- Mutants: the merge gap 8 to 4 changes bytes but not meaning, so only parity catches it; the
+  witness catches a little-endian id and a quarter-page cut.
 
 ## Differences from the C header
 
