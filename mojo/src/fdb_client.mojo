@@ -154,6 +154,14 @@ struct Fdb(Movable):
 
 # One transaction. Futures are blocked on from the calling thread; the network thread does the
 # I/O. A `Txn` is for one attempt: the retry loop lives in `run`.
+# n bytes at an address, copied into a list with one memcpy, not a byte at a time.
+def _copy_out(src: Int, n: Int) -> List[UInt8]:
+    var out = List[UInt8](length=n, fill=UInt8(0))
+    if n > 0:
+        _ = external_call["memcpy", Int](Int(out.unsafe_ptr()), src, n)
+    return out^
+
+
 struct Txn(Movable):
     var tr: Int
 
@@ -161,6 +169,10 @@ struct Txn(Movable):
         var slot = _slot()
         check(fdb.lib, fdb.lib.call["fdb_database_create_transaction", Int32](fdb.db, slot), "create_transaction")
         self.tr = _rd(slot)
+
+    # Wrap a transaction handle a slot kept, to destroy it or to use it again.
+    def __init__(out self, *, handle: Int):
+        self.tr = handle
 
     def set(self, fdb: Fdb, key: List[UInt8], value: List[UInt8]) raises:
         _ = fdb.lib.call["fdb_transaction_set", Int32](
@@ -174,7 +186,14 @@ struct Txn(Movable):
 
     # The value at `key`. The FoundationDB error, if any, is in `code` and is not raised.
     def get_result(self, fdb: Fdb, key: List[UInt8]) raises -> GetResult:
-        var f = fdb.lib.call["fdb_transaction_get", Int](self.tr, Int(key.unsafe_ptr()), Int32(len(key)), Int32(0))
+        return self.get_finish(fdb, self.get_start(fdb, key))
+
+    # Send a read and return its future without waiting, so many reads can be in flight at once.
+    # `get_finish` must follow for every future, or it leaks.
+    def get_start(self, fdb: Fdb, key: List[UInt8]) raises -> Int:
+        return fdb.lib.call["fdb_transaction_get", Int](self.tr, Int(key.unsafe_ptr()), Int32(len(key)), Int32(0))
+
+    def get_finish(self, fdb: Fdb, f: Int) raises -> GetResult:
         var rc = fdb.lib.call["fdb_future_block_until_ready", Int32](f)
         if rc == 0:
             rc = fdb.lib.call["fdb_future_get_error", Int32](f)
@@ -187,9 +206,7 @@ struct Txn(Movable):
         var present = False
         if rc == 0 and _rd32(out) != 0:
             present = True
-            var p = _rd(out, 1)
-            for i in range(_rd32(out + 16)):
-                value.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=p)[unsafe_offset=i])
+            value = _copy_out(_rd(out, 1), _rd32(out + 16))
         _ = fdb.lib.call["fdb_future_destroy", Int32](f)
         return GetResult(rc, present, value^)
 
@@ -253,15 +270,8 @@ struct Txn(Movable):
                 for r in range(_rd32(out + 8)):
                     var row = kv + r * 24
                     var kp = _rd(row)
-                    var key = List[UInt8]()
-                    for i in range(_rd32(row + 8)):
-                        key.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=kp)[unsafe_offset=i])
-                    var vp = _rd(row + 12)
-                    var value = List[UInt8]()
-                    for i in range(_rd32(row + 20)):
-                        value.append(Pointer[UInt8, MutAnyOrigin](unsafe_from_address=vp)[unsafe_offset=i])
-                    keys.append(key^)
-                    values.append(value^)
+                    keys.append(_copy_out(kp, _rd32(row + 8)))
+                    values.append(_copy_out(_rd(row + 12), _rd32(row + 20)))
         _ = fdb.lib.call["fdb_future_destroy", Int32](f)
         return RangeResult(rc, more, keys^, values^)
 
@@ -271,7 +281,13 @@ struct Txn(Movable):
 
     # Commit. Returns the error code, 0 for success; the caller decides with `on_error`.
     def commit(self, fdb: Fdb) raises -> Int32:
-        var f = fdb.lib.call["fdb_transaction_commit", Int](self.tr)
+        return self.commit_finish(fdb, self.commit_start(fdb))
+
+    # Send the commit and return its future without waiting for it.
+    def commit_start(self, fdb: Fdb) raises -> Int:
+        return fdb.lib.call["fdb_transaction_commit", Int](self.tr)
+
+    def commit_finish(self, fdb: Fdb, f: Int) raises -> Int32:
         var rc = fdb.lib.call["fdb_future_block_until_ready", Int32](f)
         if rc == 0:
             rc = fdb.lib.call["fdb_future_get_error", Int32](f)

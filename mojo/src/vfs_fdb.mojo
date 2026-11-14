@@ -457,10 +457,11 @@ def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
 # at the head is written to SHARD/<head>/<pgno>, and one last transaction sets SHARDN/<head>,
 # clears every PIDX and DELTA row and every older shard version, and zeroes LOGN. It is owed when
 # the log is as large as the base, and paid when the file closes. This one reads and writes a
-# window at a time and waits for each; the C keeps four windows' commits in flight.
+# window at a time, with up to FOLD_DEPTH windows' commits in flight while the next is read, as the C does.
 
 comptime STAGE_TXN_PAGES = FDB_TXN_LIMIT // DELTA_ROW
 comptime FOLD_WINDOW_PAGES = STAGE_TXN_PAGES // 4
+comptime FOLD_DEPTH = 4
 
 
 def should_compact(f: FileState) -> Bool:
@@ -532,42 +533,69 @@ def fold_read_body(fdb: Fdb, t: Txn, f: FileState, lo: Int, hi: Int, mut w: Fold
             begin = r.keys[len(r.keys) - 1].copy()
             after = True
 
+    # Every logged page's row is read at once, as the C does: a round trip a page was ten
+    # seconds at close for a 25,000 row table. A delta needs its base, a second wave in flight.
+    var first = List[Int]()
     for i in range(n):
         if owner[i] == 0:
+            first.append(0)
+        else:
+            first.append(t.get_start(fdb, key_delta(f.name, UInt64(owner[i]), UInt32(lo + i))))
+    var err = Int32(0)
+    var rows = List[List[UInt8]]()  # a delta row, kept until its base arrives
+    for i in range(n):
+        rows.append(List[UInt8]())
+    for i in range(n):
+        if first[i] == 0:
             continue
-        var pgno = lo + i
-        var row = t.get_result(fdb, key_delta(f.name, UInt64(owner[i]), UInt32(pgno)))
+        var row = t.get_finish(fdb, first[i])  # every future is finished, even after an error
         if row.code != 0:
-            return row.code
+            if err == 0:
+                err = row.code
+            continue
         if not row.present:
             continue
         if is_delta(row.value):
-            var kind = Int(row.value[1])
-            var bid = delta_base_id(row.value)
-            var bk = List[UInt8]()
-            if kind == BASE_TXID:
-                bk = key_delta(f.name, bid, UInt32(pgno))
-            elif kind == BASE_SHARD:
-                bk = key_shard(f.name, bid, UInt32(pgno))
-            else:
-                return Int32(2000)
-            var base = t.get_result(fdb, bk)
-            if base.code != 0:
-                return base.code
-            if not base.present or len(base.value) != PAGE:
-                return Int32(2000)  # a base is a full row
-            var page = base.value.copy()
-            if delta_apply(row.value, page) != 0:
-                return Int32(2000)
-            w.pages[i] = page^
-            w.present[i] = True
+            rows[i] = row.value.copy()
         else:
             var v = row.value.copy()
             if len(v) > PAGE:
                 v.resize(PAGE, 0)
             w.pages[i] = v^
             w.present[i] = True
-    return 0
+    var second = List[Int]()
+    for i in range(n):
+        second.append(0)
+        if err != 0 or len(rows[i]) == 0:
+            continue
+        var kind = Int(rows[i][1])
+        var bid = delta_base_id(rows[i])
+        if kind == BASE_TXID:
+            second[i] = t.get_start(fdb, key_delta(f.name, bid, UInt32(lo + i)))
+        elif kind == BASE_SHARD:
+            second[i] = t.get_start(fdb, key_shard(f.name, bid, UInt32(lo + i)))
+        else:
+            err = Int32(2000)
+    for i in range(n):
+        if second[i] == 0:
+            continue
+        var base = t.get_finish(fdb, second[i])
+        if base.code != 0:
+            if err == 0:
+                err = base.code
+            continue
+        if not base.present or len(base.value) != PAGE:
+            if err == 0:
+                err = Int32(2000)  # a base is a full row
+            continue
+        var page = base.value.copy()
+        if delta_apply(rows[i], page) != 0:
+            if err == 0:
+                err = Int32(2000)
+            continue
+        w.pages[i] = page^
+        w.present[i] = True
+    return err
 
 
 def fold_write_body(fdb: Fdb, t: Txn, f: FileState, as_of: Int, lo: Int, w: FoldWindow) raises -> Int32:
@@ -598,6 +626,71 @@ def fold_finish_body(fdb: Fdb, t: Txn, f: FileState, as_of: Int, kept: Int) rais
     return 0
 
 
+# A window whose commit is in flight. `sent` says it has rows to settle; `fut` is 0 when the
+# commit could not be started and the window goes the slow way, through the retry loop.
+struct FoldSlot(Movable):
+    var w: FoldWindow
+    var tr: Int
+    var fut: Int
+    var sent: Bool
+    var lo: Int
+
+    def __init__(out self):
+        self.w = FoldWindow()
+        self.tr = 0
+        self.fut = 0
+        self.sent = False
+        self.lo = 0
+
+
+# Wait for a window's commit. One that failed goes again through the retry loop, which knows
+# which errors may be retried and checks the fence; the rows are the same rows under a shard
+# version no read uses yet, so writing them twice is harmless.
+def fold_settle(fdb: Fdb, f: FileState, as_of: Int, mut s: FoldSlot, mut kept: Int) raises -> Int32:
+    if not s.sent:
+        return 0
+    var again = True
+    if s.fut != 0:
+        var rc = Txn(handle=s.tr).commit_finish(fdb, s.fut)
+        again = rc != 0
+        s.fut = 0
+    if s.tr != 0:
+        Txn(handle=s.tr).destroy(fdb)
+        s.tr = 0
+    s.sent = False
+    if again:
+        while True:
+            var t = Txn(fdb)
+            var code = fold_write_body(fdb, t, f, as_of, s.lo, s.w)
+            var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
+            if r == -1:
+                continue
+            if r != 0:
+                return r
+            break
+    for i in range(len(s.w.present)):
+        if s.w.present[i]:
+            kept += 1
+    return 0
+
+
+# Start a window's commit and return without waiting for it.
+def fold_send(fdb: Fdb, f: FileState, as_of: Int, mut s: FoldSlot) raises -> Int32:
+    s.sent = True
+    var t = Txn(fdb)
+    var code = fold_write_body(fdb, t, f, as_of, s.lo, s.w)
+    if code < 0:
+        t.destroy(fdb)
+        s.sent = False
+        return -code
+    if code != 0:
+        t.destroy(fdb)  # the slow way, at settle
+        return 0
+    s.tr = t.tr
+    s.fut = t.commit_start(fdb)
+    return 0
+
+
 def do_compact(mut ctx: Ctx, idx: Int) raises -> Int32:
     ref fdb = _fdb(ctx.fdb_addr)[]
     ref f = ctx.files[idx]
@@ -608,35 +701,49 @@ def do_compact(mut ctx: Ctx, idx: Int) raises -> Int32:
     var window = FOLD_WINDOW_PAGES
     if window > npages:
         window = npages
+    var slots = List[FoldSlot]()
+    for _ in range(FOLD_DEPTH):
+        slots.append(FoldSlot())
     var kept = 0
+    var rc = Int32(0)
+    var k = 0
     var lo = 0
-    while lo < npages:
+    while lo < npages and rc == 0:
+        ref s = slots[k % FOLD_DEPTH]
+        rc = fold_settle(fdb, f, as_of, s, kept)
+        if rc != 0:
+            break
+        s.lo = lo
         var hi = lo + window
         if hi > npages:
             hi = npages
-        var w = FoldWindow()
         while True:
             var t = Txn(fdb)
-            var code = fold_read_body(fdb, t, f, lo, hi, w)
+            var code = fold_read_body(fdb, t, f, lo, hi, s.w)
             var r = settle(fdb, t, code, False, Int32(SQLITE_IOERR_READ))
             if r == -1:
                 continue
-            if r != 0:
-                return r
+            rc = r
             break
-        while True:
-            var t = Txn(fdb)
-            var code = fold_write_body(fdb, t, f, as_of, lo, w)
-            var r = settle(fdb, t, code, True, Int32(SQLITE_IOERR_WRITE))
-            if r == -1:
-                continue
-            if r != 0:
-                return r
+        if rc != 0:
             break
-        for i in range(len(w.present)):
-            if w.present[i]:
-                kept += 1
-        lo = hi
+        rc = fold_send(fdb, f, as_of, s)
+        lo += window
+        k += 1
+    # Every window settles, even after a failure, so no commit is left in flight.
+    for i in range(FOLD_DEPTH):
+        ref s = slots[i]
+        if rc == 0:
+            rc = fold_settle(fdb, f, as_of, s, kept)
+        else:
+            if s.fut != 0:
+                _ = Txn(handle=s.tr).commit_finish(fdb, s.fut)
+                s.fut = 0
+            if s.tr != 0:
+                Txn(handle=s.tr).destroy(fdb)
+                s.tr = 0
+    if rc != 0:
+        return rc
     while True:
         var t = Txn(fdb)
         var code = fold_finish_body(fdb, t, f, as_of, kept)

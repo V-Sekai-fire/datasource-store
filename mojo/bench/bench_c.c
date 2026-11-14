@@ -88,6 +88,10 @@ int main(int argc, char **argv) {
 	if (sqlite3_step(st) == SQLITE_ROW)
 		printf("%s\trows\t%lld/%lld/%lld\n", label, (long long)sqlite3_column_int64(st, 0), (long long)sqlite3_column_int64(st, 1), (long long)sqlite3_column_int64(st, 2));
 	sqlite3_finalize(st);
+	// closing pays a fold that is owed: the log has grown as large as the base
+	double tc = now();
 	sqlite3_close(db);
+	double dc = now() - tc;
+	printf("%s\tclose (pays the owed fold)\t1\t%.4f\t%.2f\t%.0f\n", label, dc, 1.0 / dc, dc * 1e6);
 	return 0;
 }

@@ -177,12 +177,25 @@ fold was ported (20 rows against 9), so it can fail. The same script reads in bo
 Mojo reads a store the C wrote and folded, with deltas against its shard, and the C reads what
 Mojo wrote.
 
-The fold here waits on each window, where the C keeps four windows' commits in flight. The bytes
-are the same; the time is not.
+The fold reads and writes a window of pages at a time, as the C does: every logged page's row is
+requested at once, then every base row, and up to four windows' commits are in flight while the next
+window is read. Closing a database of 100,600 posts and 101,200 likes (about 6,000 pages) in a
+container on one single-node in-memory FoundationDB, two runs each, one fresh container per run:
+
+| Close, paying the owed fold | Run 1 | Run 2 |
+|---|---|---|
+| Mojo VFS, a window at a time and each get waited on | 1.217 s | 1.272 s |
+| Mojo VFS, pipelined | 0.187 s | 0.201 s |
+| C VFS | 0.184 s | 0.191 s |
+
+`BENCH=1 ONLY=both USERS=25000 POSTS=100000 LIKES=200000 sh tests/fdb_container.sh` reproduces it.
+A wipe of a large store leaves the storage server busy, so `bench.sh` waits after each wipe; before
+that wait a Mojo run that followed a C run read 2.5 s, which was the wipe and not the fold.
 
 ## Benchmark
 
 `bench/` runs the $12-server challenge's operations on plain SQLite, the C VFS and the Mojo VFS
 (`BENCH=1 sh tests/fdb_container.sh`). Measured in the container on one single-node in-memory
 FoundationDB: single commits are equal, batched writes are 93 to 98 percent of the C's, and a
-feed read after the writes is about 75 percent of it, for a reason not found yet.
+feed read after the writes is about 75 percent of it, for a reason not found yet. The fold at
+close is within about 5 percent of the C's (table above).
