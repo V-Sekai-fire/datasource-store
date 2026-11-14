@@ -241,3 +241,44 @@ Each file reports its time in milliseconds from the runner's own clock, and from
 `Txn.read_version` in `fdb_client.mojo`. A read version is the newest commit's, and advances about
 1,000,000 a second while commits happen, so the difference of two is a duration the database
 agrees with.
+
+## Direct B-tree reads
+
+`bench/btree.mojo` reads two things both ways on one database, over SQLite's own file VFS and over
+the Mojo VFS: through SQL, and through SQLite's B-tree cursor calls inside a read transaction, as
+the mojo-iouring submission to the $12 server challenge does. A post by id is a posts row, its
+user and its like count. The feed is the 20 newest posts, each the same way.
+
+    BTREE=1 BTREE_MUTANTS=1 sh tests/fdb_container.sh
+
+Measured in the container, three runs each, on 5,000 users, 20,000 posts and about 40,000 likes,
+SQL against direct reads in operations a second:
+
+| Read | VFS | SQL | Direct |
+|---|---|---|---|
+| Post by id | SQLite's file VFS | 1.28 M | 2.45 M |
+| Post by id | Mojo VFS over FoundationDB | 1.26 M | 2.34 M to 2.48 M |
+| Feed, 20 posts | SQLite's file VFS | 91 k to 94 k | 233 k to 253 k |
+| Feed, 20 posts | Mojo VFS over FoundationDB | 88 k to 93 k | 252 k to 253 k |
+
+The VFS does not matter: reads come from SQLite's page cache. The gain is the SQL engine, which
+the direct path skips. A profile of the SQL path shows the B-tree seek as the largest item, then
+mutex lock and unlock, `VdbeExec` and `VdbeHalt`, and cursor open and close, which the direct path
+does not pay. A profile of the direct path alone is about 70 percent `sqlite3BtreeTableMoveto`.
+
+What it costs, and how the driver guards it:
+
+- It needs SQLite's internals, so the amalgamation is built with `-DSQLITE_PRIVATE=`. The version is
+  pinned to 3.50.4; any other version does not run the direct path.
+- It takes the Btree from `sqlite3DbNameToBtree`, not from a struct offset. One size is assumed,
+  `sizeof(Mem)` of 56, for the key of the likes index; the checks below fail if it is wrong.
+- Before timing, 2,000 posts and the feed are checked against SQL, value for value.
+- The feed is reverse rowid order only while ids are dense and `created_at` never falls with id.
+  SQL checks both; a planted post older than its predecessor must be seen.
+- A record on overflow pages is read whole with `sqlite3BtreePayload`, tested with an 8,000 byte
+  body.
+- Five planted faults are each caught: a like counted twice, an overflow record not followed, the
+  index search skipping a step, a user read from the wrong row, and a wrong version pin. The
+  unmutated driver must pass first, or a failure proves nothing. The first version of this check
+  passed for a wrong reason: the driver crashed in the container on an uninitialized key, which
+  failed every mutant alike.

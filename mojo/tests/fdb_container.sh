@@ -24,7 +24,7 @@ sleep 4
 cd /work/mojo
 pixi install --locked 2>&1 | tail -1
 export WEFT_FDB_LIB=/opt/fdb/libfdb_c.so WEFT_FDB_CLUSTER_FILE=/opt/fdb/fdb.cluster
-if [ -z "${BENCH:-}" ] && [ -z "${SLT:-}" ]; then
+if [ -z "${BENCH:-}" ] && [ -z "${SLT:-}" ] && [ -z "${BTREE:-}" ]; then
 	pixi run fdb-client
 	pixi run vfs-fdb
 fi
@@ -114,4 +114,46 @@ if [ -n "${SLT:-}" ]; then
 	mkdir -p build
 	pixi run mojo build -I src bench/slt.mojo -o build/slt 2>&1 | grep -E "^.*error" -A3 || true
 	WEFT_SQLITE_LIB=/usr/lib/$ARCH-linux-gnu/libsqlite3.so.0 sh bench/slt.sh
+fi
+
+# BTREE=1: direct B-tree reads against SQL reads, on SQLite's file VFS and on the Mojo VFS. Needs a
+# SQLite with its internals visible, so build the amalgamation with SQLITE_PRIVATE blanked.
+if [ -n "${BTREE:-}" ]; then
+	apt-get install -y -qq --no-install-recommends gcc libc6-dev unzip >/dev/null
+	curl -fsSL -o /tmp/amal.zip https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip
+	unzip -oq /tmp/amal.zip -d /tmp/amal
+	gcc -O2 -shared -fPIC -DSQLITE_PRIVATE= -DSQLITE_THREADSAFE=1 /tmp/amal/sqlite-amalgamation-3500400/sqlite3.c \
+		-o /tmp/libsqlite3_int.so -lpthread -ldl -lm
+	mkdir -p build
+	pixi run mojo build -I src bench/btree.mojo -o build/btree 2>&1 | grep -E "^.*error" -A3 || true
+	export WEFT_SQLITE_LIB=/tmp/libsqlite3_int.so
+	# planted faults in the direct path: each must make the driver fail, or say it is off
+	if [ -n "${BTREE_MUTANTS:-}" ]; then
+		cp bench/btree.mojo /tmp/btree.orig
+		bt_mutant() {
+			cp /tmp/btree.orig bench/btree.mojo
+			sed -i "$2" bench/btree.mojo
+			if cmp -s /tmp/btree.orig bench/btree.mojo; then echo "BTREE MUTANT $1: pattern did not apply"; return; fi
+			pixi run mojo build -I src bench/btree.mojo -o build/btree_m 2>&1 | grep -E "^.*error" -A3 || true
+			rm -f /tmp/bt-m.db*
+			out=$(build/btree_m /tmp/bt-m.db unix 2000 2>&1) && rc=0 || rc=$?
+			if [ "$rc" -ne 0 ] || echo "$out" | grep -q "direct path off"; then echo "BTREE MUTANT $1: caught"; else echo "BTREE MUTANT $1: SURVIVED"; fi
+		}
+		# the unmutated driver must pass on the same arguments, or a failure proves nothing
+		rm -f /tmp/bt-m.db*
+		build/btree /tmp/bt-m.db unix 2000 > /tmp/bt-control.out 2>&1 && echo "BTREE CONTROL: the unmutated driver passes" || { echo "BTREE CONTROL: the unmutated driver FAILS"; tail -5 /tmp/bt-control.out; }
+		bt_mutant "a like is counted twice" 's/^        n += 1$/        n += 2/'
+		bt_mutant "an overflow record is not followed" 's/^    if peek32(s.amt) >= total:$/    if True:/'
+		bt_mutant "the index search skips its first step" 's/^    if peek32(s.res) < 0:$/    if False:/'
+		bt_mutant "a user is read from the wrong row" 's/if not seek(moveto, s, s.users, uid):/if not seek(moveto, s, s.users, uid + 1):/'
+		bt_mutant "the version pin is wrong" 's/comptime TESTED_VERSION = 3050004/comptime TESTED_VERSION = 3050003/'
+		cp /tmp/btree.orig bench/btree.mojo
+	fi
+	for i in 1 2 3; do
+		echo "== run $i, SQLite's file VFS"
+		rm -f /tmp/bt.db*
+		build/btree /tmp/bt.db unix ${BTREE_ITERS:-400000}
+		echo "== run $i, Mojo VFS over FoundationDB"
+		build/btree "bt-$i-$$" weft_mojo_fdb ${BTREE_ITERS:-400000}
+	done
 fi
