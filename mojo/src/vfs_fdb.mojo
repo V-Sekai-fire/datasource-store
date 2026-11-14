@@ -6,16 +6,17 @@
 #   open     reads HEAD and SIZE, drops the pages of a commit that never finished, and raises
 #            the fence (a reader takes no fence and tidies nothing)
 #   read     the dirty buffer first, then PIDX -> DELTA/<txid>/<pgno>, applying a delta to its
-#            base row; one FoundationDB transaction per call, retried the way FoundationDB asks
+#            base row, else the newest shard's SHARD/<as_of>/<pgno> when no commit owns the page;
+#            one FoundationDB transaction per call, retried the way FoundationDB asks
 #   write    buffers whole pages; a partial page is read from the store first
-#   sync     one transaction: the fence check, the DELTA rows, the PIDX rows, SIZE, LOGN, HEAD
+#   sync     one transaction: the fence check, the DELTA rows, the PIDX rows, SIZE, LOGN, HEAD.
+#            A page with a base row is sent as a delta when under a fifth of it changed, else whole
 #   truncate drops buffered pages, and clears the PIDX rows past the end at the next commit
 #   delete   clears everything under weft/db/<name>/
 #
 # What it does not do yet, and refuses rather than gets wrong:
-#   * a database that has a shard version (a compaction ran) is not opened: there is no shard read
+#   * no compaction: a fold is not written here, though a store the C folded is read (SHARD rows)
 #   * a commit above ONE_TXN_PAGES is refused: staged commits are not here
-#   * pages are written whole, never as a delta (the codec is ported; the base cache is not)
 #   * no read-ahead, no cached read transaction, no cross-database commit, no fold
 #
 # SPDX-License-Identifier: Apache-2.0 OR MIT
@@ -58,6 +59,20 @@ comptime IOCAP_SEQUENTIAL = 0x400
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
+# The full row a page's next delta is taken against: a log row by txid, or a shard page by its
+# version. `bytes` is that row as stored, so a delta of `bytes` applies to the row. One slot per
+# page number modulo BASE_SLOTS, as in the C.
+comptime BASE_SLOTS = 4096
+
+
+@fieldwise_init
+struct BaseEntry(Copyable, Movable):
+    var pgno: Int
+    var kind: Int
+    var id: Int
+    var bytes: List[UInt8]
+
+
 struct FileState(Movable):
     var name: String
     var head: Int
@@ -67,11 +82,16 @@ struct FileState(Movable):
     var readonly: Bool
     var trunc_pages: Int
     var log_pages: Int
+    var has_shard: Bool
+    var shard_as_of: Int
+    var base_pages: Int
     var pidx_row: Int
     var pgnos: List[Int]
     var pages: List[List[UInt8]]
     var where_: Dict[Int, Int]
     var short_read: Bool
+    var bases: Dict[Int, BaseEntry]
+    var as_delta: List[Bool]
 
     def __init__(out self, name: String, readonly: Bool):
         self.name = name.copy()
@@ -82,11 +102,28 @@ struct FileState(Movable):
         self.readonly = readonly
         self.trunc_pages = -1
         self.log_pages = 0
+        self.has_shard = False
+        self.shard_as_of = 0
+        self.base_pages = 0
         self.pidx_row = len(key_pidx(name, 0)) + 8
         self.pgnos = List[Int]()
         self.pages = List[List[UInt8]]()
         self.where_ = Dict[Int, Int]()
         self.short_read = False
+        self.bases = Dict[Int, BaseEntry]()
+        self.as_delta = List[Bool]()
+
+    def base_get(self, pgno: Int) -> Optional[BaseEntry]:
+        var e = self.bases.get(pgno % BASE_SLOTS)
+        if e and e.value().pgno == pgno and e.value().kind != 0:
+            return e.value().copy()
+        return None
+
+    # A reader keeps no bases: it never writes a delta.
+    def base_put(mut self, pgno: Int, kind: Int, id: Int, bytes: List[UInt8]):
+        if self.readonly:
+            return
+        self.bases[pgno % BASE_SLOTS] = BaseEntry(pgno, kind, id, bytes.copy())
 
     def clear_dirty(mut self):
         self.pgnos = List[Int]()
@@ -175,14 +212,22 @@ def open_body(fdb: Fdb, t: Txn, mut f: FileState) raises -> Int32:
         return l.code
     f.log_pages = be64_of(l)
 
-    # A compacted database keeps pages in SHARD rows, which this cut cannot read. Refuse to open
-    # it; reading its pages as holes would be silent corruption.
+    # The newest shard version at or below the head: the base a read falls through to when no
+    # commit owns the page. `fdb_vfs.c` calls this load_newest_shard.
+    f.has_shard = False
+    f.shard_as_of = 0
+    f.base_pages = 0
     var from_k = key_prefix(f.name, "SHARDN")
     var e = t.edge(fdb, from_k, key_shardn(f.name, UInt64(f.head + 1)), True)
     if e.code != 0:
         return e.code
     if e.found:
-        return Int32(-SQLITE_CANTOPEN)
+        f.has_shard = True
+        f.shard_as_of = Int(get_be64(e.key, len(e.key) - 8))
+        var bp = t.get_result(fdb, key_shardn(f.name, UInt64(f.shard_as_of)))
+        if bp.code != 0:
+            return bp.code
+        f.base_pages = be64_of(bp)
 
     if f.readonly:
         f.sent_size = f.size
@@ -214,13 +259,23 @@ def do_open(mut ctx: Ctx, fdb: Fdb, idx: Int) raises -> Int32:
 # One page from the store: PIDX names the commit that owns it, and that commit's row is the page,
 # or a delta against a full row. `present` stays False when no commit holds the page.
 def page_from_store(
-    fdb: Fdb, t: Txn, f: FileState, pgno: Int, mut page: List[UInt8], mut present: Bool
+    fdb: Fdb, t: Txn, mut f: FileState, pgno: Int, mut page: List[UInt8], mut present: Bool
 ) raises -> Int32:
     present = False
     var owner = t.get_result(fdb, key_pidx(f.name, UInt32(pgno)))
     if owner.code != 0:
         return owner.code
     if not owner.present:
+        # No commit owns the page: it is in the shard, or it is a hole.
+        if f.has_shard:
+            var sh = t.get_result(fdb, key_shard(f.name, UInt64(f.shard_as_of), UInt32(pgno)))
+            if sh.code != 0:
+                return sh.code
+            if sh.present:
+                present = True
+                page = sh.value.copy()
+                if len(page) == PAGE:
+                    f.base_put(pgno, BASE_SHARD, f.shard_as_of, page)
         return 0
     var row = t.get_result(fdb, key_delta(f.name, UInt64(be64_of(owner)), UInt32(pgno)))
     if row.code != 0:
@@ -228,8 +283,11 @@ def page_from_store(
     if not row.present:
         return 2000  # PIDX points at a row that is not there: not retryable
     present = True
+    var otx = be64_of(owner)
     if not is_delta(row.value):
         page = row.value.copy()
+        if len(page) == PAGE:
+            f.base_put(pgno, BASE_TXID, otx, page)
         return 0
     # A delta is read against its base, which is always a full row.
     var kind = Int(row.value[1])
@@ -247,6 +305,7 @@ def page_from_store(
     if not base.present or len(base.value) != PAGE:
         return 2000
     page = base.value.copy()
+    f.base_put(pgno, kind, Int(bid), page)
     if delta_apply(row.value, page) != 0:
         return 2000
     return 0
@@ -363,9 +422,19 @@ def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
     var fc = check_fence(fdb, t, f)
     if fc != 0:
         return fc
+    f.as_delta = List[Bool]()
     for i in range(len(f.pgnos)):
         var pgno = UInt32(f.pgnos[i])
-        t.set(fdb, key_delta(f.name, UInt64(txid), pgno), f.pages[i])
+        var row = List[UInt8]()
+        var b = f.base_get(f.pgnos[i])
+        if b:
+            row = delta_encode(b.value().bytes, f.pages[i], b.value().kind, UInt64(b.value().id))
+        if len(row) > 0:
+            f.as_delta.append(True)
+            t.set(fdb, key_delta(f.name, UInt64(txid), pgno), row)
+        else:
+            f.as_delta.append(False)
+            t.set(fdb, key_delta(f.name, UInt64(txid), pgno), f.pages[i])
     for i in range(len(f.pgnos)):
         t.set(fdb, key_pidx(f.name, UInt32(f.pgnos[i])), u64_value(txid))
     if f.trunc_pages >= 0:
@@ -393,6 +462,10 @@ def do_flush(mut ctx: Ctx, idx: Int) raises -> Int32:
             continue
         if r != 0:
             return r
+        for i in range(len(f.pgnos)):
+            if not f.as_delta[i]:
+                var whole = f.pages[i].copy()
+                f.base_put(f.pgnos[i], BASE_TXID, txid, whole)
         f.head = txid
         f.sent_size = f.size
         f.log_pages += len(f.pgnos)

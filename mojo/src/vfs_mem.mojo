@@ -36,6 +36,11 @@ comptime MAX_PATH = 512
 # SQLite from the pixi environment (CONDA_PREFIX is set under `pixi run`), then the system's.
 def open_sqlite() raises -> OwnedDLHandle:
     var candidates = List[String]()
+    # WEFT_SQLITE_LIB names the library outright, so a test can run Mojo and the C on one SQLite
+    # and compare the bytes they write (SQLite's version number is in page 0).
+    var forced = getenv("WEFT_SQLITE_LIB")
+    if forced.byte_length() > 0:
+        candidates.append(forced)
     var prefix = getenv("CONDA_PREFIX")
     if prefix.byte_length() > 0:
         candidates.append(prefix + "/lib/libsqlite3.dylib")

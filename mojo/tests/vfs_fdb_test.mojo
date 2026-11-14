@@ -9,6 +9,7 @@ from fdb_client import *
 from fdb_keys import *
 from vfs_mem import open_sqlite
 from vfs_fdb import *
+from page_delta import is_delta, delta_apply, delta_base_id
 
 
 def check(label: String, ok: Bool, mut failed: Int):
@@ -111,8 +112,15 @@ def main() raises:
     check("PIDX/0 names a txid at or below HEAD", p0.present and Int(get_be64(p0.value, 0)) <= head and Int(get_be64(p0.value, 0)) >= 1, failed)
     var owner = Int(get_be64(p0.value, 0))
     var row = tp.get_result(obs, key_delta(name, UInt64(owner), 0))
-    check("DELTA/<owner>/0 is a whole 4096-byte page", row.present and len(row.value) == PAGE, failed)
-    check("page 0 holds SQLite's header ('SQLite format 3', page size 4096 at byte 16)", row.present and row.value[0] == 0x53 and row.value[1] == 0x51 and row.value[15] == 0x00 and row.value[16] == 0x10 and row.value[17] == 0x00, failed)
+    # the owner's row is a whole page or a delta against a whole row; rebuild the page either way
+    var page0 = row.value.copy()
+    if row.present and is_delta(row.value):
+        var brow = tp.get_result(obs, key_delta(name, delta_base_id(row.value), 0))
+        page0 = brow.value.copy()
+        check("a delta row's base is a whole page", brow.present and len(brow.value) == PAGE, failed)
+        check("the delta applies to its base", delta_apply(row.value, page0) == 0, failed)
+    check("DELTA/<owner>/0 rebuilds to a whole 4096-byte page", row.present and len(page0) == PAGE, failed)
+    check("page 0 holds SQLite's header ('SQLite format 3', page size 4096 at byte 16)", len(page0) == PAGE and page0[0] == 0x53 and page0[1] == 0x51 and page0[16] == 0x10 and page0[17] == 0x00, failed)
     var p1 = tp.get_result(obs, key_pidx(name, 1))
     check("and PIDX/1 exists for the second page", p1.present, failed)
     var last = tp.get_result(obs, key_pidx(name, UInt32(pages - 1)))
@@ -137,11 +145,38 @@ def main() raises:
     check("the new owner writes", run(lib, db3, "insert into t values (5001, 'owner')") == 0, failed)
     check("and HEAD moved", stored_u64(obs, key_meta(name, "HEAD")) > before, failed)
     _ = lib.call["sqlite3_close", Int32](db2)
+
+    # Deltas: db3 has read its pages, so each is a base. A small update changes a few bytes of a
+    # few pages, and those go to the store as deltas against their bases, not as whole pages.
+    check("a small update on the owner", run(lib, db3, "update t set v='delta-test-row' where id=500") == 0, failed)
+    var dhead = stored_u64(obs, key_meta(name, "HEAD"))
+    var tdl = Txn(obs)
+    var n_delta = 0
+    var n_whole = 0
+    var delta_ok = True
+    for pg in range(size // PAGE):
+        var r = tdl.get_result(obs, key_delta(name, UInt64(dhead), UInt32(pg)))
+        if r.present:
+            if len(r.value) == PAGE:
+                n_whole += 1
+            elif len(r.value) < 820 and r.value[0] == 0xD7:
+                n_delta += 1
+            else:
+                delta_ok = False
+    tdl.destroy(obs)
+    print("the update's commit wrote", n_delta, "delta row(s) and", n_whole, "whole page(s)")
+    check("the commit wrote at least one delta row", n_delta >= 1, failed)
+    check("every row is a whole page or a delta under a fifth of one", delta_ok, failed)
     _ = lib.call["sqlite3_close", Int32](db3)
+    var db3b = open_db(lib, name, V, 6)
+    check("a fresh open reads the delta back", scalar(lib, db3b, "select count(*) from t where v='delta-test-row'") == 1, failed)
+    check("and the rest of the page it patched is intact", scalar(lib, db3b, "select count(*) from t where id between 490 and 510") == 21, failed)
+    check("integrity_check is ok after a delta commit", scalar(lib, db3b, "select count(*) from pragma_integrity_check where integrity_check='ok'") == 1, failed)
+    _ = lib.call["sqlite3_close", Int32](db3b)
 
     # a read-only open takes no fence and sees the committed state
     var dbr = open_db(lib, name, V, 1)
-    check("a read-only open leaves the fence at 3", stored_u64(obs, key_meta(name, "FENCE")) == 3, failed)
+    check("a read-only open leaves the fence at 4 (the delta test's reopen raised it)", stored_u64(obs, key_meta(name, "FENCE")) == 4, failed)
     check("and sees the owner's row", scalar(lib, dbr, "select count(*) from t where v='owner'") == 1, failed)
     check("the stale writer's row never landed", scalar(lib, dbr, "select count(*) from t where id=5000") == 0, failed)
     _ = lib.call["sqlite3_close", Int32](dbr)

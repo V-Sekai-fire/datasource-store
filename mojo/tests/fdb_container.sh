@@ -24,8 +24,42 @@ sleep 4
 cd /work/mojo
 pixi install --locked 2>&1 | tail -1
 export WEFT_FDB_LIB=/opt/fdb/libfdb_c.so WEFT_FDB_CLUSTER_FILE=/opt/fdb/fdb.cluster
-pixi run fdb-client
-pixi run vfs-fdb
+if [ -z "${BENCH:-}" ]; then
+	pixi run fdb-client
+	pixi run vfs-fdb
+fi
+
+# CROSS=1: the C VFS and the Mojo VFS on one store, each reading what the other wrote.
+if [ -n "${CROSS:-}" ]; then
+	apt-get install -y -qq --no-install-recommends cmake gcc g++ make libsqlite3-dev >/dev/null
+	case "$ARCH" in x86_64) DEB=amd64 ;; *) DEB=$ARCH ;; esac
+	curl -fsSL -o /tmp/fdbc.deb "$base/foundationdb-clients_$FDB_VERSION-1_$DEB.deb"
+	dpkg -x /tmp/fdbc.deb /tmp/fdbc
+	mkdir -p /tmp/csrc && (cd /src && tar cf - --exclude=mojo --exclude=.git --exclude=thirdparty .) | (cd /tmp/csrc && tar xf -)
+	[ -d /src/thirdparty ] && cp -r /src/thirdparty /tmp/csrc/ 2>/dev/null || true
+	cmake -S /tmp/csrc -B /tmp/cbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DFDB_INCLUDE_DIR=/tmp/fdbc/usr/include -DFDB_LIBRARY=/tmp/fdbc/usr/lib/libfdb_c.so >/dev/null
+	cmake --build /tmp/cbuild --target sqlrun -j4 2>&1 | tail -2
+	WEFT_SQLITE_LIB=/usr/lib/$ARCH-linux-gnu/libsqlite3.so.0 SQLRUN=/tmp/cbuild/sqlrun FDBCLI=/opt/fdb/fdbcli sh tests/cross.sh
+fi
+
+# BENCH=1: pure SQLite, the C VFS and the Mojo VFS on the $12-server challenge's workload.
+if [ -n "${BENCH:-}" ]; then
+	apt-get install -y -qq --no-install-recommends cmake gcc g++ make libsqlite3-dev >/dev/null
+	case "$ARCH" in x86_64) DEB=amd64 ;; *) DEB=$ARCH ;; esac
+	curl -fsSL -o /tmp/fdbc.deb "$base/foundationdb-clients_$FDB_VERSION-1_$DEB.deb"
+	dpkg -x /tmp/fdbc.deb /tmp/fdbc
+	mkdir -p /tmp/csrc && (cd /src && tar cf - --exclude=mojo --exclude=.git .) | (cd /tmp/csrc && tar xf -)
+	cmake -S /tmp/csrc -B /tmp/cbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DFDB_INCLUDE_DIR=/tmp/fdbc/usr/include -DFDB_LIBRARY=/tmp/fdbc/usr/lib/libfdb_c.so >/dev/null
+	cmake --build /tmp/cbuild --target weft_fdb_vfs -j4 2>&1 | tail -1
+	mkdir -p build
+	gcc -O2 -I/tmp/csrc -o build/bench_c bench/bench_c.c /tmp/cbuild/libweft_fdb_vfs.a \
+		-L/tmp/fdbc/usr/lib -lfdb_c -lsqlite3 -lpthread -lm
+	export LD_LIBRARY_PATH=/tmp/fdbc/usr/lib
+	pixi run mojo build -I src bench/bench.mojo -o build/bench 2>&1 | grep -E "^.*error" -A3 || true
+	WEFT_SQLITE_LIB=/usr/lib/$ARCH-linux-gnu/libsqlite3.so.0 FDBCLI=/opt/fdb/fdbcli sh bench/bench.sh
+fi
 
 # MUTANTS=1: break the client and the VFS and require the matching test to fail each time.
 if [ -n "${MUTANTS:-}" ]; then
