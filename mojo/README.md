@@ -33,7 +33,8 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | 3c-2 | Shard reads, delta writes, and the fold at close | `fdb_vfs.c` | Done. Same bytes as the C: `tests/cross.sh` |
 | 3c-3 | Staged commits above one transaction, and recovery of group commits another committer left staging | `fdb_vfs.c` | Done. Same bytes as the C for 2,300-page commits: `tests/cross.sh` |
 | 3c-4 | Starting a cross-database group: `weft_txn_begin`, `join`, `commit`, `abort` | `fdb_vfs.c` | Done. The C reads what a Mojo group wrote: `tests/cross.sh` |
-| 3c-5 | Read-ahead, readers that follow the head | `fdb_vfs.c` | Not started |
+| 3c-5 | Read-ahead window | `fdb_vfs.c` | Done. A scan of 600 shard pages: 586 from windows, 343 to 393 ms against 447 to 450 ms without |
+| 3c-6 | Cached read transaction, readers that follow the head | `fdb_vfs.c` | Not started (issues 64 and 72) |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
 

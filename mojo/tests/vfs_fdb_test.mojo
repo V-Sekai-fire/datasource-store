@@ -2,6 +2,7 @@
 # (WEFT_FDB_CLUSTER_FILE). The checks are on what SQLite sees, on what is in FoundationDB
 # (the keys the C layout names), and on the fence refusing a second writer.
 # SPDX-License-Identifier: Apache-2.0 OR MIT
+from std.time import perf_counter_ns
 from std.ffi import OwnedDLHandle
 from std.memory import alloc
 from std.os import getenv
@@ -615,6 +616,55 @@ def main() raises:
         tgz.clear_range(obs, key_meta(nm, ""), key_after(key_meta(nm, "")))
     check("clean up the group-commit databases", tgz.commit(obs) == 0, failed)
     tgz.destroy(obs)
+
+    # The read-ahead window. A scan fills it from the shard in a few range reads instead of a page
+    # at a time, and a commit, a fold or a truncate must drop it: a window read against a store
+    # that changed is free to be wrong. 600 rows of 3,900 bytes are about 600 pages, folded into a
+    # shard when the first connection closes, and a ten page cache sends every read to the VFS.
+    var rname = String("mojo-vfs-readahead")
+    var trc = Txn(obs)
+    trc.clear_range(obs, key_meta(rname, ""), key_after(key_meta(rname, "")))
+    _ = trc.commit(obs)
+    trc.destroy(obs)
+    var dbw = open_db(lib, rname, V, 6)
+    _ = run(lib, dbw, "pragma journal_mode=memory; pragma locking_mode=exclusive; create table r(id integer primary key, v blob)")
+    check("read-ahead: write 600 pages", run(lib, dbw, "with recursive c(x) as (select 1 union all select x+1 from c where x<600) insert into r select x, zeroblob(3900) from c") == 0, failed)
+    check("read-ahead: mark each row", run(lib, dbw, "update r set v = printf('%0*d', 3900, id)") == 0, failed)
+    _ = lib.call["sqlite3_close", Int32](dbw)
+    check("read-ahead: close folded the store into a shard", count_rows(obs, key_shard_version(rname, UInt64(stored_u64(obs, key_meta(rname, "HEAD"))))) > 400, failed)
+    var rh = 0
+    check("read-ahead: reopen", open_rc(lib, rname, V, 6, rh) == 0, failed)
+    _ = run(lib, rh, "pragma cache_size=10; pragma locking_mode=exclusive")
+    var fills0 = ra_fills_total(ctx)
+    var hits0 = ra_hits_total(ctx)
+    var tscan = Int(perf_counter_ns())
+    var rsum = scalar(lib, rh, "select sum(length(v)) from r")
+    print("scan of 600 pages:", (Int(perf_counter_ns()) - tscan) // 1000000, "ms")
+    check("read-ahead: a scan reads every row", rsum == 600 * 3900, failed)
+    check("read-ahead: the scan filled windows", ra_fills_total(ctx) > fills0, failed)
+    check("read-ahead: and most of its pages came from them (" + String(ra_hits_total(ctx) - hits0) + ")", ra_hits_total(ctx) - hits0 > 300, failed)
+    var rcheck = scalar(lib, rh, "select count(*) from r where v = printf('%0*d', 3900, id)")
+    check("read-ahead: every page held the right bytes", rcheck == 600, failed)
+    # a commit changes pages the window holds: the next scan must see the new bytes
+    # A window outlives the transaction that filled it, so the commit must drop it: read a run of
+    # pages to fill one, then commit, and the window must be empty.
+    _ = scalar(lib, rh, "select sum(length(v)) from r where id between 100 and 140")
+    check("read-ahead: a short scan left a window (" + String(ra_window_pages(lib, ctx, rh)) + " pages)", ra_window_pages(lib, ctx, rh) > 0, failed)
+    check("read-ahead: update rows across the table", run(lib, rh, "update r set v = printf('%0*d', 3900, id + 1000) where id % 7 = 0") == 0, failed)
+    check("read-ahead: the commit dropped the window", ra_window_pages(lib, ctx, rh) == 0, failed)
+    var rnew = scalar(lib, rh, "select count(*) from r where v = printf('%0*d', 3900, id + 1000)")
+    check("read-ahead: a scan after the commit sees the new bytes, not the window's (" + String(rnew) + ")", rnew == 85, failed)
+    var rold = scalar(lib, rh, "select count(*) from r where v = printf('%0*d', 3900, id)")
+    check("read-ahead: and the rows it did not change are as they were", rold == 600 - 85, failed)
+    # a delete shrinks the file: the next scan must not return pages past the end
+    check("read-ahead: delete the tail", run(lib, rh, "delete from r where id > 300") == 0, failed)
+    check("read-ahead: a scan after the delete sees 300 rows", scalar(lib, rh, "select count(*) from r") == 300, failed)
+    check("read-ahead: and integrity_check is ok", scalar(lib, rh, "select count(*) from pragma_integrity_check where integrity_check='ok'") == 1, failed)
+    _ = lib.call["sqlite3_close", Int32](rh)
+    var rr = Txn(obs)
+    rr.clear_range(obs, key_meta(rname, ""), key_after(key_meta(rname, "")))
+    check("clean up the read-ahead database", rr.commit(obs) == 0, failed)
+    rr.destroy(obs)
 
     # leave nothing behind
     check("the database exists", stored_u64(obs, key_meta(name, "SIZE")) > 0, failed)

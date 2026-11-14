@@ -18,7 +18,7 @@
 #
 # What it does not do yet, and refuses rather than gets wrong:
 #   * no compaction: a fold is not written here, though a store the C folded is read (SHARD rows)
-#   * no read-ahead and no cached read transaction. It starts groups (weft_txn_begin and the rest)
+#   * no cached read transaction and no reader that follows the head. It reads ahead, starts groups (weft_txn_begin and the rest)
 #     and a writer's open decides the groups the C left staging (recover_groups)
 #
 # SPDX-License-Identifier: Apache-2.0 OR MIT
@@ -28,6 +28,13 @@ from std.memory import alloc
 from fdb_client import *
 from fdb_keys import *
 from page_delta import *
+from read_ahead import ReadAhead, RA_MAX_PAGES
+
+# What a window says about a page. A prefetch does not fetch every page it covers, and a page it
+# never fetched says nothing: reading it as a hole would lose a log-owned page.
+comptime RA_UNFETCHED = 0
+comptime RA_PRESENT = 1
+comptime RA_ABSENT = 2
 from vfs_mem import (
     peek64, poke64, poke32, poke_i64, cstr, _bytes, _addr,
     F_close, F_rw, F_trunc, F_int, F_ptr, F_ctl, F_one, F_open, F_del, F_acc, F_full, F_rnd,
@@ -96,6 +103,13 @@ struct FileState(Movable):
     var bases: Dict[Int, BaseEntry]
     var as_delta: List[Bool]
     var group_txnid: Int  # nonzero while this file belongs to an open group: its syncs stage
+    var ra: ReadAhead  # how much this file looks like a scan, and the last page read
+    var ra_window: List[UInt8]  # ra_count pages, allocated when a scan earns one
+    var ra_state: List[UInt8]  # RA_UNFETCHED, RA_PRESENT or RA_ABSENT, a byte a page
+    var ra_first: Int
+    var ra_count: Int
+    var ra_hits: Int  # pages answered from the window
+    var ra_fills: Int  # windows filled
 
     def __init__(out self, name: String, readonly: Bool):
         self.name = name.copy()
@@ -118,6 +132,13 @@ struct FileState(Movable):
         self.bases = Dict[Int, BaseEntry]()
         self.as_delta = List[Bool]()
         self.group_txnid = 0
+        self.ra = ReadAhead()
+        self.ra_window = List[UInt8]()
+        self.ra_state = List[UInt8]()
+        self.ra_first = 0
+        self.ra_count = 0
+        self.ra_hits = 0
+        self.ra_fills = 0
 
     def base_get(self, pgno: Int) -> Optional[BaseEntry]:
         var e = self.bases.get(pgno % BASE_SLOTS)
@@ -132,6 +153,7 @@ struct FileState(Movable):
         self.bases[pgno % BASE_SLOTS] = BaseEntry(pgno, kind, id, bytes.copy())
 
     def clear_dirty(mut self):
+        self.ra_count = 0  # those pages are not what the window holds any more
         self.pgnos = List[Int]()
         self.pages = List[List[UInt8]]()
         self.where_ = Dict[Int, Int]()
@@ -233,6 +255,7 @@ def open_body(fdb: Fdb, t: Txn, mut f: FileState) raises -> Int32:
     f.has_shard = False
     f.shard_as_of = 0
     f.base_pages = 0
+    f.ra_count = 0
     var from_k = key_prefix(f.name, "SHARDN")
     var e = t.edge(fdb, from_k, key_shardn(f.name, UInt64(f.head + 1)), True)
     if e.code != 0:
@@ -506,12 +529,126 @@ def do_open(mut ctx: Ctx, fdb: Fdb, idx: Int) raises -> Int32:
 
 # ── Read ──────────────────────────────────────────────────────────────────────
 
+# Fill the window with `count` pages from `first`: the owner of each from one range read of PIDX,
+# and the pages the shard holds from one of SHARD. A page a commit owns stays unfetched (DELTA is
+# keyed by txid first, so those are scattered), and a page nobody owns with nothing in the shard
+# is a hole, which is as good an answer as a page. The window shrinks to what the reads reached: a
+# range read that stops early says `more`, and a page past it is outside the window, never absent.
+def ra_fill(fdb: Fdb, t: Txn, mut f: FileState, first: Int, count_in: Int) raises -> Int32:
+    var count = count_in if count_in < RA_MAX_PAGES else RA_MAX_PAGES
+    if len(f.ra_window) == 0:
+        f.ra_window = List[UInt8](length=RA_MAX_PAGES * PAGE, fill=0)
+        f.ra_state = List[UInt8](length=RA_MAX_PAGES, fill=0)
+    for i in range(count):
+        f.ra_state[i] = UInt8(RA_UNFETCHED)
+    f.ra_first = first
+    f.ra_count = count
+    var owner = List[Bool](length=count, fill=False)
+
+    var begin = key_pidx(f.name, UInt32(first))
+    var end = key_pidx(f.name, UInt32(first + count))
+    var after = False
+    var reached = first
+    while True:
+        var r = t.range_rows(fdb, begin, after, end)
+        if r.code != 0:
+            f.ra_count = 0
+            return r.code
+        for i in range(len(r.keys)):
+            var k = r.keys[i].copy()
+            if len(k) < 4 or len(r.values[i]) != 8:
+                continue
+            var pg = (Int(k[len(k) - 4]) << 24) | (Int(k[len(k) - 3]) << 16) | (Int(k[len(k) - 2]) << 8) | Int(k[len(k) - 1])
+            if pg >= first and pg < first + count:
+                owner[pg - first] = True
+                if pg + 1 > reached:
+                    reached = pg + 1
+        if not r.more or len(r.keys) == 0:
+            break
+        begin = r.keys[len(r.keys) - 1].copy()
+        after = True
+    # PIDX is sparse, so a short answer is ordinary; the loop above followed every `more`.
+
+    if f.has_shard:
+        var sb = key_shard(f.name, UInt64(f.shard_as_of), UInt32(first))
+        var se = key_shard(f.name, UInt64(f.shard_as_of), UInt32(first + count))
+        var safter = False
+        var sreached = first
+        while True:
+            var r = t.range_rows(fdb, sb, safter, se)
+            if r.code != 0:
+                f.ra_count = 0
+                return r.code
+            for i in range(len(r.keys)):
+                var k = r.keys[i].copy()
+                var vl = len(r.values[i])
+                if len(k) < 4 or vl > PAGE:
+                    continue
+                var pg = (Int(k[len(k) - 4]) << 24) | (Int(k[len(k) - 3]) << 16) | (Int(k[len(k) - 2]) << 8) | Int(k[len(k) - 1])
+                if pg < first or pg >= first + count:
+                    continue
+                var j = pg - first
+                if owner[j]:
+                    continue  # the log's copy is newer than the shard's
+                for b in range(PAGE):
+                    f.ra_window[j * PAGE + b] = r.values[i][b] if b < vl else UInt8(0)
+                f.ra_state[j] = UInt8(RA_PRESENT)
+                if pg + 1 > sreached:
+                    sreached = pg + 1
+            if not r.more or len(r.keys) == 0:
+                break
+            sb = r.keys[len(r.keys) - 1].copy()
+            safter = True
+    for i in range(count):
+        if owner[i]:
+            f.ra_state[i] = UInt8(RA_UNFETCHED)
+        elif Int(f.ra_state[i]) != RA_PRESENT:
+            f.ra_state[i] = UInt8(RA_ABSENT if f.has_shard else RA_UNFETCHED)
+    f.ra_count = count
+    f.ra_fills += 1
+    return 0
+
+
+# Is this page already in the window? `present` is False for a hole the prefetch saw.
+def ra_hit(mut f: FileState, pgno: Int, mut page: List[UInt8], mut present: Bool) -> Bool:
+    if f.ra_count == 0 or pgno < f.ra_first or pgno >= f.ra_first + f.ra_count:
+        return False
+    var i = pgno - f.ra_first
+    var st = Int(f.ra_state[i])
+    if st == RA_ABSENT:
+        present = False
+        f.ra_hits += 1
+        return True
+    if st != RA_PRESENT:
+        return False
+    page = List[UInt8](length=PAGE, fill=0)
+    for b in range(PAGE):
+        page[b] = f.ra_window[i * PAGE + b]
+    present = True
+    f.ra_hits += 1
+    return True
+
+
 # One page from the store: PIDX names the commit that owns it, and that commit's row is the page,
 # or a delta against a full row. `present` stays False when no commit holds the page.
 def page_from_store(
     fdb: Fdb, t: Txn, mut f: FileState, pgno: Int, mut page: List[UInt8], mut present: Bool
 ) raises -> Int32:
     present = False
+    # A window holds shard pages only, so a hit is a full shard row.
+    if ra_hit(f, pgno, page, present):
+        if present:
+            f.base_put(pgno, BASE_SHARD, f.shard_as_of, page)
+        return 0
+    var depth = f.ra.depth(pgno)
+    if depth > 0:
+        var pre = ra_fill(fdb, t, f, pgno, depth)
+        if pre != 0:
+            return pre
+        if ra_hit(f, pgno, page, present):
+            if present:
+                f.base_put(pgno, BASE_SHARD, f.shard_as_of, page)
+            return 0
     var owner = t.get_result(fdb, key_pidx(f.name, UInt32(pgno)))
     if owner.code != 0:
         return owner.code
@@ -1036,6 +1173,7 @@ def do_compact(mut ctx: Ctx, idx: Int) raises -> Int32:
         break
     f.has_shard = True
     f.shard_as_of = as_of
+    f.ra_count = 0  # the window points at a shard version that is no longer the one read
     f.base_pages = kept
     f.log_pages = 0
     # The fold deleted every log row and the old shard, which is every base this handle knew.
@@ -1400,6 +1538,7 @@ def fdb_truncate(file: Int, size: Int64) abi("C") -> Int32:
     if f.trunc_pages < 0 or npages < f.trunc_pages:
         f.trunc_pages = npages
     f.size = Int(size)
+    f.ra_count = 0
     return 0
 
 
@@ -1535,3 +1674,30 @@ def register_fdb(lib: OwnedDLHandle, name: String, cluster_file: String, make_de
 # The state of an open file, for a test to look at.
 def file_head(ctx_addr: Int, idx: Int) -> Int:
     return _ctx(ctx_addr)[].files[idx].head
+
+
+# How many pages the read-ahead windows have answered, and how many were filled, over every file.
+def ra_hits_total(ctx_addr: Int) -> Int:
+    var n = 0
+    for i in range(len(_ctx(ctx_addr)[].files)):
+        n += _ctx(ctx_addr)[].files[i].ra_hits
+    return n
+
+
+def ra_fills_total(ctx_addr: Int) -> Int:
+    var n = 0
+    for i in range(len(_ctx(ctx_addr)[].files)):
+        n += _ctx(ctx_addr)[].files[i].ra_fills
+    return n
+
+
+# The pages the file's read-ahead window holds now, for the file a connection has open.
+def ra_window_pages(lib: OwnedDLHandle, ctx_addr: Int, db: Int) raises -> Int:
+    var slot = alloc[Int](1)
+    slot[unsafe_offset=0] = 0
+    var rc = lib.call["sqlite3_file_control", Int32](db, "main".unsafe_ptr(), Int32(SQLITE_FCNTL_FILE_POINTER), slot)
+    var file = slot[unsafe_offset=0]
+    slot.free()
+    if rc != 0 or file == 0:
+        return -1
+    return _ctx(ctx_addr)[].files[peek64(file + 16)].ra_count

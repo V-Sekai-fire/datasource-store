@@ -71,6 +71,9 @@ if [ -n "${MUTANTS:-}" ]; then
 	mutant vfs-fdb $V "group: no head is moved" sed -i 's/        var code = head_body(fdb, t, f, staged)/        var code = Int32(0)/' $V
 	mutant vfs-fdb $V "group: the record is never dropped" sed -i 's/            var code = drop_record_body(fdb, t, txnid)/            var code = Int32(0)/' $V
 	mutant vfs-fdb $V "group: an abort leaves its members flagged" perl -0pi -e 's/(def weft_txn_abort.*?)release_group\(c\)/$1pass/s' $V
+	mutant vfs-fdb $V "read-ahead: a commit leaves the window" sed -i 's/        self.ra_count = 0  # those pages/        pass  # those pages/' $V
+	mutant vfs-fdb $V "read-ahead: a page the log owns is read from the window" sed -i 's/        if owner\[i\]:/        if False:/' $V
+	mutant vfs-fdb $V "read-ahead: a hit reads the page next to the one asked for" sed -i 's/    var i = pgno - f.ra_first$/    var i = pgno - f.ra_first + 1/' $V
 	mutant vfs-fdb $V "staging: the last chunk is never written" sed -i 's/            lo += STAGE_TXN_PAGES/            lo += 2 * STAGE_TXN_PAGES/' $V
 	mutant vfs-fdb $V "staging: a chunk does not check the fence" perl -0pi -e 's/(def delta_body.*?\n)    var fc = check_fence\(fdb, t, f\)\n    if fc != 0:\n        return fc\n/$1/s' $V
 	cp /tmp/fdb_client.orig src/fdb_client.mojo
