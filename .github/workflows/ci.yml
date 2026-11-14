@@ -7,7 +7,7 @@
 # locally is the failure that arrangement produces.
 #
 # Three jobs, because they need different things. `test` needs a live FoundationDB, since
-# every program it runs is a program about a database. `fuzz` needs neither FoundationDB
+# every program it runs is a program about a database. `mojo-keys` needs neither FoundationDB
 # nor SQLite: `fdb_keys.h` is pure, which is why it was split out. `spec` needs Lean and
 # nothing else.
 name: ci
@@ -60,30 +60,17 @@ jobs:
       - name: The commit stage
         run: ./ci.sh deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext
 
-  keys-witness:
+  backup-fresh:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
-      # witness-cpp is header-only C++17; the ordinary system Clang is enough.
-      - name: Install Clang
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
-
-      - name: cache the witness-cpp build
-        uses: actions/cache@v6
-        with:
-          path: build-keys-witness/_deps
-          key: keys-witness-${{ hashFiles('keys-witness/CMakeLists.txt') }}
-
-      - name: The key properties
-        env:
-          CC: clang
-          CXX: clang++
-        run: ./ci.sh keys-witness backup-fresh
+      - name: The backup probe against its own controls
+        run: ./ci.sh backup-fresh
 
   # The Mojo port of the key layout, diffed against the C header and gated by witness-mojo.
-  # Needs pixi and the network for contract-witness-mojo, and neither FoundationDB nor SQLite.
+  # Needs pixi and the network for contract-witness-mojo (pinned in ci.sh), and neither FoundationDB nor SQLite.
   mojo-keys:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

@@ -1,6 +1,6 @@
 # The property gate for `fdb_keys.mojo`, over `contract-witness-mojo`.
 #
-# This is the Mojo port of `keys-witness/keys_test.cc` (witness-cpp + doctest). Every
+# This is the Mojo port of `keys-witness/keys_test.cc` (witness-cpp + doctest, since removed). Every
 # property is paired with a planted-false rule-2 control: the same machinery with a
 # wrong encoder or a wrong predicate must come back FOUND, or the gate cannot fail and
 # proves nothing.

@@ -23,7 +23,7 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 | # | Slice | C source | Status |
 |---|-------|----------|--------|
 | 1 | Key layout | `fdb_keys.h` | Done. `src/fdb_keys.mojo` |
-| 1 | Key layout witness | `keys-witness/keys_test.cc` | Done. `tests/keys_witness.mojo` (replaces witness-cpp and doctest) |
+| 1 | Key layout witness | `keys-witness/keys_test.cc` | Done. `tests/keys_witness.mojo` replaced it, and witness-cpp and doctest with it |
 | 2 | Page-delta, read-ahead and commit models | `spec/*.lean` checked against `fdb_vfs.c` | Not started |
 | 3 | `weft_fdb_vfs` (SQLite VFS over FoundationDB) | `fdb_vfs.c` | Not started. Needs an FDB C client and a `sqlite3_vfs` binding through Mojo's C interop |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
@@ -59,8 +59,8 @@ that keeps trailing `0xFF`). Both mutants fail the gate and the parity diff.
 
 ## Not yet verified
 
-- The C++ `keys-witness` stage still runs beside the Mojo one (`./ci.sh mojo-keys`, job `mojo-keys`); neither replaces the other yet.
-- `ci.sh mojo-keys` clones contract-witness-mojo `main` when no sibling checkout exists, so the ladder is not pinned.
+- `./ci.sh mojo-keys` (job `mojo-keys`) is the only gate on the key layout; the C++ one is gone.
+- The ladder is pinned by `WITNESS_MOJO_REV` in `ci.sh`; bump it on purpose.
 - Shrinking is off for the compound inputs (`no_shrink`), so a failure prints the input as
   drawn, not a minimum.
 - Only macOS arm64 was run. `pixi.toml` lists linux-64 and linux-aarch64 untested.

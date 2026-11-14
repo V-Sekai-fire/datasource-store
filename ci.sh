@@ -23,11 +23,10 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$here"
 
 BUILD=${BUILD:-build}
-KEYS_WITNESS_BUILD=${KEYS_WITNESS_BUILD:-build-keys-witness}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext keys-witness mojo-keys backup-fresh spec tla'
+ALL='deps build surface handoff fence-read clock integrity big-commit parallel-commit crash vfs-ext mojo-keys backup-fresh spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -320,31 +319,27 @@ stage_vfs_ext() {
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
-# `fdb_keys.h` is pure, which is why it was split out: this needs neither FoundationDB nor
-# SQLite. Ten properties + nine paired rule-2 planted-false controls, over witness-cpp and
-# doctest; header-only, no network fetch of a fuzzer framework, exception-free build.
-stage_keys_witness() {
-	cmake -S keys-witness -B "$KEYS_WITNESS_BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo
-	cmake --build "$KEYS_WITNESS_BUILD" -j"${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
-	ctest --test-dir "$KEYS_WITNESS_BUILD" --output-on-failure
-}
-
-# The Mojo port of `fdb_keys.h`: the real header compiled as the oracle and diffed against
-# the port, then the contract-witness-mojo gate. Needs pixi, and neither FoundationDB nor
-# SQLite. In the workspace the witness ladder is the sibling checkout `../witness-mojo`;
-# elsewhere WITNESS_MOJO names a clone of V-Sekai-fire/contract-witness-mojo, or the stage
-# clones one into the build directory.
+# The Mojo key layout. `fdb_keys.h` is pure, which is why it was split out: this needs
+# neither FoundationDB nor SQLite. The real header is compiled as the oracle and diffed
+# against the Mojo port, then the contract-witness-mojo gate runs ten properties and nine
+# paired planted-false controls. The ladder is cloned at WITNESS_MOJO_REV, so a change
+# upstream cannot break this stage; WITNESS_MOJO names a checkout to use instead (a
+# developer's sibling clone), and it is then the caller's to keep at a known commit.
+WITNESS_MOJO_REV=${WITNESS_MOJO_REV:-f7a97a92520d89d52eb4d48570d644da88d47a4f}
 stage_mojo_keys() {
 	command -v pixi >/dev/null 2>&1 || { echo "missing: pixi"; return 1; }
 	wm=${WITNESS_MOJO:-}
-	if [ -z "$wm" ] && [ -d ../witness-mojo/src ]; then
-		wm=$(CDPATH= cd -- ../witness-mojo && pwd)
-	fi
 	if [ -z "$wm" ]; then
 		wm="$here/$BUILD/witness-mojo"
-		[ -d "$wm/src" ] || git clone --depth 1 https://github.com/V-Sekai-fire/contract-witness-mojo.git "$wm"
+		if [ ! -d "$wm/.git" ]; then
+			git init -q "$wm"
+			git -C "$wm" remote add origin https://github.com/V-Sekai-fire/contract-witness-mojo.git
+		fi
+		git -C "$wm" fetch -q --depth 1 origin "$WITNESS_MOJO_REV"
+		git -C "$wm" checkout -q --detach FETCH_HEAD
 	fi
 	[ -f "$wm/src/witness/ladder.mojo" ] || { echo "missing: $wm/src/witness/ladder.mojo"; return 1; }
+	echo "witness ladder: $wm at $(git -C "$wm" rev-parse HEAD 2>/dev/null || echo unknown)"
 	cd mojo
 	mkdir -p build
 	pixi run parity

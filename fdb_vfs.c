@@ -274,7 +274,7 @@ static fdb_error_t await(FDBFuture *f) {
 // ── Keys ──────────────────────────────────────────────────────────────────────
 //
 // In `fdb_keys.h`, because they depend on neither FoundationDB nor SQLite and
-// `keys-witness/keys_test.cc` tests them without either. A number goes into a key big endian, so
+// `mojo/tests/keys_witness.mojo` tests them without either. A number goes into a key big endian, so
 // the order of the keys is the order of the numbers, and a range read then gives pages
 // and commits in order.
 
