@@ -26,18 +26,24 @@ VFSP="pragma journal_mode=memory; pragma locking_mode=exclusive; pragma cache_si
 
 : > "$OUT"
 rm -f /tmp/b-*.db*
+if [ -z "${ONLY:-}" ]; then
 echo "pure sqlite, challenge pragmas (C driver)"
 ./build/bench_c /tmp/plan.txt /tmp/b-wal.db unix "$WAL" "1 pure WAL" >> "$OUT"
 echo "pure sqlite, VFS pragmas (C driver)"
 ./build/bench_c /tmp/plan.txt /tmp/b-same.db unix "$SAME" "2 pure, as the VFSs (C driver)" >> "$OUT"
 echo "pure sqlite, VFS pragmas (Mojo driver)"
 ./build/bench /tmp/plan.txt /tmp/b-same2.db unix "$SAME" "3 pure, as the VFSs (Mojo driver)" >> "$OUT"
+fi
+if [ -z "${ONLY:-}" ] || [ "$ONLY" = c ]; then
 echo "C VFS"
 wipe
 ./build/bench_c /tmp/plan.txt bench.db weft_fdb "$VFSP" "4 C VFS over FoundationDB" >> "$OUT"
+fi
+if [ -z "${ONLY:-}" ] || [ "$ONLY" = mojo ]; then
 echo "Mojo VFS"
 wipe
 ./build/bench /tmp/plan.txt bench.db weft_mojo_fdb "$VFSP" "5 Mojo VFS over FoundationDB" >> "$OUT"
+fi
 
 # The same rows in every run, or the comparison is not one.
 echo "== row counts (users/posts/likes) after the run"
@@ -66,3 +72,5 @@ END {
 	printf "\n"
 	for (i=1;i<=m;i++) printf "  %s\n", labs[i]
 }' "$OUT"
+
+[ -z "${ONLY:-}" ] || grep PROFILE "$OUT" || true

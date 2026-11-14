@@ -426,9 +426,12 @@ def commit_body(fdb: Fdb, t: Txn, mut f: FileState, txid: Int) raises -> Int32:
     for i in range(len(f.pgnos)):
         var pgno = UInt32(f.pgnos[i])
         var row = List[UInt8]()
-        var b = f.base_get(f.pgnos[i])
-        if b:
-            row = delta_encode(b.value().bytes, f.pages[i], b.value().kind, UInt64(b.value().id))
+        # borrow the base entry: it is a 4 KB row, and a copy per page costs more than the encode
+        var slot = f.pgnos[i] % BASE_SLOTS
+        if slot in f.bases:
+            ref be = f.bases[slot]
+            if be.pgno == f.pgnos[i] and be.kind != 0:
+                row = delta_encode(be.bytes, f.pages[i], be.kind, UInt64(be.id))
         if len(row) > 0:
             f.as_delta.append(True)
             t.set(fdb, key_delta(f.name, UInt64(txid), pgno), row)
