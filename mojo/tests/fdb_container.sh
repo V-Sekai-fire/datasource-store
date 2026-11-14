@@ -24,7 +24,7 @@ sleep 4
 cd /work/mojo
 pixi install --locked 2>&1 | tail -1
 export WEFT_FDB_LIB=/opt/fdb/libfdb_c.so WEFT_FDB_CLUSTER_FILE=/opt/fdb/fdb.cluster
-if [ -z "${BENCH:-}" ]; then
+if [ -z "${BENCH:-}" ] && [ -z "${SLT:-}" ]; then
 	pixi run fdb-client
 	pixi run vfs-fdb
 fi
@@ -44,6 +44,7 @@ if [ -n "${MUTANTS:-}" ]; then
 	}
 	C=src/fdb_client.mojo
 	V=src/vfs_fdb.mojo
+	mutant fdb-client $C "client: the read version is in the wrong unit" sed -i 's|        return _rd(out)$|        return _rd(out) // 1000|' $C
 	mutant fdb-client $C "client: set drops a byte of the value" sed -i 's/Int32(len(value))/Int32(len(value) - 1)/' $C
 	mutant fdb-client $C "client: clear_range has its ends swapped" sed -i 's/Int(begin.unsafe_ptr()), Int32(len(begin)), Int(end.unsafe_ptr()), Int32(len(end))/Int(end.unsafe_ptr()), Int32(len(end)), Int(begin.unsafe_ptr()), Int32(len(begin))/' $C
 	mutant fdb-client $C "client: get never sees a value" sed -i 's/if rc == 0 and _rd32(out) != 0:/if False:/' $C
@@ -103,3 +104,14 @@ if [ -n "${BENCH:-}" ]; then
 	WEFT_SQLITE_LIB=/usr/lib/$ARCH-linux-gnu/libsqlite3.so.0 FDBCLI=/opt/fdb/fdbcli sh bench/bench.sh
 fi
 
+
+# SLT=1: the sqllogictest corpus through SQLite's own file VFS and the Mojo VFS, diffed.
+if [ -n "${SLT:-}" ]; then
+	apt-get install -y -qq --no-install-recommends gcc libc6-dev libsqlite3-dev >/dev/null
+	# SLT_SED: a sed expression applied to src/vfs_fdb.mojo first, to plant a fault and see the
+	# suite catch it.
+	if [ -n "${SLT_SED:-}" ]; then sed -i "$SLT_SED" src/vfs_fdb.mojo; fi
+	mkdir -p build
+	pixi run mojo build -I src bench/slt.mojo -o build/slt 2>&1 | grep -E "^.*error" -A3 || true
+	WEFT_SQLITE_LIB=/usr/lib/$ARCH-linux-gnu/libsqlite3.so.0 sh bench/slt.sh
+fi

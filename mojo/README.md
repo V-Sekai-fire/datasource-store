@@ -216,3 +216,28 @@ rows above the head, as `recover_one` does in the C: all intents durable finishe
 missing intent aborts it and raises the fence of the participant that lacked one, and no other. A
 reader skips this. This VFS decides groups; it cannot start one. A group participant must stage in
 one transaction in the C, so a group never takes the chunked path.
+
+## SQLite's own test corpus
+
+`bench/slt.mojo` runs sqllogictest files, the corpus SQLite ships for checking engines against each
+other, through SQLite's own file VFS and through the Mojo VFS, and `bench/slt.sh` diffs the two,
+record by record. It does not compare with the file's expected results, which test SQLite. It
+compares what SQLite answers over this VFS with what it answers over its own, so any line that
+differs is the VFS changing an answer.
+
+    SLT=1 sh tests/fdb_container.sh     # with the corpus mounted at /slt
+
+The corpus is `github.com/gregrahn/sqllogictest`. The run uses 23 files: `select1` to `select5`, the
+`evidence` files, and one `index` file for each of six index operations. That is 72,112 records,
+and the two sides agree on all of them.
+
+Both sides run with a ten page cache, so reads go back through the VFS. With SQLite's own cache a
+single session never reads a page back, and a fault in what the VFS stored would pass. The control
+that shows this: with the PIDX rows left out of every commit, the suite passes at the default cache
+and fails both files tried at ten pages (`SLT_SED` plants a fault in `vfs_fdb.mojo` first). The
+price is time: `select4` takes 119 s through the Mojo VFS, against 1.8 s on a local file.
+
+Each file reports its time in milliseconds from the runner's own clock, and from FoundationDB's:
+`Txn.read_version` in `fdb_client.mojo`. A read version is the newest commit's, and advances about
+1,000,000 a second while commits happen, so the difference of two is a duration the database
+agrees with.

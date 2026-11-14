@@ -3,6 +3,7 @@
 # cluster; WEFT_FDB_CLUSTER_FILE names its file, as it does for the C programs.
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 from std.os import getenv
+from std.time import sleep
 from fdb_client import *
 from fdb_keys import *
 
@@ -122,6 +123,26 @@ def main() raises:
     tc.clear_range(fdb, from_k, to_k)
     check("clear the shard versions", tc.commit(fdb) == 0, failed)
     tc.destroy(fdb)
+
+    # the database's clock: read versions advance about 1,000,000 a second. A read version is the
+    # newest commit's, so an idle cluster's stands still: commit before each reading.
+    var tw1 = Txn(fdb)
+    tw1.set(fdb, k1, v1)
+    check("a commit to read the clock after", tw1.commit(fdb) == 0, failed)
+    tw1.destroy(fdb)
+    var tv1 = Txn(fdb)
+    var ver1 = tv1.read_version(fdb)
+    tv1.destroy(fdb)
+    sleep(0.5)
+    var tw2 = Txn(fdb)
+    tw2.set(fdb, k1, v1)
+    check("and another, half a second later", tw2.commit(fdb) == 0, failed)
+    tw2.destroy(fdb)
+    var tv2 = Txn(fdb)
+    var ver2 = tv2.read_version(fdb)
+    tv2.destroy(fdb)
+    check("a read version is positive", ver1 > 0, failed)
+    check("half a second later it has advanced by about 500,000 (" + String(ver2 - ver1) + ")", ver2 - ver1 > 400000 and ver2 - ver1 < 1500000, failed)
 
     # batch priority, the one option the store sets: it changes when a transaction is admitted,
     # not what it does

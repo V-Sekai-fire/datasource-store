@@ -280,6 +280,21 @@ struct Txn(Movable):
         return fdb.lib.call["fdb_transaction_set_option", Int32](self.tr, Int32(TR_OPTION_PRIORITY_BATCH), 0, Int32(0))
 
     # Commit. Returns the error code, 0 for success; the caller decides with `on_error`.
+    # FoundationDB's clock. A read version is a point in the database's own time: it advances by
+    # about 1,000,000 a second, whatever the host clock says, so the difference of two is a
+    # duration the database agrees with. Returns -1 when the call fails.
+    def read_version(self, fdb: Fdb) raises -> Int:
+        var f = fdb.lib.call["fdb_transaction_get_read_version", Int](self.tr)
+        var rc = fdb.lib.call["fdb_future_block_until_ready", Int32](f)
+        if rc == 0:
+            rc = fdb.lib.call["fdb_future_get_error", Int32](f)
+        var out = _slot()
+        if rc == 0:
+            rc = fdb.lib.call["fdb_future_get_int64", Int32](f, out)
+        _ = fdb.lib.call["fdb_future_destroy", Int32](f)
+        if rc != 0:
+            return -1
+        return _rd(out)
     def commit(self, fdb: Fdb) raises -> Int32:
         return self.commit_finish(fdb, self.commit_start(fdb))
 
