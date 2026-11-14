@@ -319,10 +319,10 @@ stage_vfs_ext() {
 	fdbcli -C "$WEFT_FDB_CLUSTER_FILE" --exec "writemode on; clearrange weft/db/$db/ weft/db/${db}0" >/dev/null 2>&1 || true
 }
 
-# The Mojo key layout. `fdb_keys.h` is pure, which is why it was split out: this needs
-# neither FoundationDB nor SQLite. The real header is compiled as the oracle and diffed
-# against the Mojo port, then the contract-witness-mojo gate runs ten properties and nine
-# paired planted-false controls. The ladder is cloned at WITNESS_MOJO_REV, so a change
+# The Mojo ports: the key layout, the page delta codec, and the read-ahead scorer. `fdb_keys.h` is pure, which is why it was split out: this needs
+# neither FoundationDB nor SQLite. The real C is compiled as the oracle (the header, and the
+# blocks cut out of fdb_vfs.c) and diffed against the Mojo port, then the
+# contract-witness-mojo gates run their properties and paired planted-false controls. The ladder is cloned at WITNESS_MOJO_REV, so a change
 # upstream cannot break this stage; WITNESS_MOJO names a checkout to use instead (a
 # developer's sibling clone), and it is then the caller's to keep at a known commit.
 WITNESS_MOJO_REV=${WITNESS_MOJO_REV:-f7a97a92520d89d52eb4d48570d644da88d47a4f}
@@ -344,6 +344,8 @@ stage_mojo_keys() {
 	mkdir -p build
 	pixi run parity
 	pixi run mojo run -I src -I "$wm/src" tests/keys_witness.mojo
+	pixi run mojo run -I src -I "$wm/src" tests/delta_witness.mojo
+	pixi run mojo run -I src -I "$wm/src" tests/readahead_witness.mojo
 }
 # The probe weftspun-fdb's backup checks read, run against its own controls before a machine
 # arms it, so a regression fails here rather than leaving a production check critical.

@@ -24,7 +24,9 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 |---|-------|----------|--------|
 | 1 | Key layout | `fdb_keys.h` | Done. `src/fdb_keys.mojo` |
 | 1 | Key layout witness | `keys-witness/keys_test.cc` | Done. `tests/keys_witness.mojo` replaced it, and witness-cpp and doctest with it |
-| 2 | Page-delta, read-ahead and commit models | `spec/*.lean` checked against `fdb_vfs.c` | Not started |
+| 2a | Page delta codec | `fdb_vfs.c` "Page deltas" block, `spec/PageDelta.lean` | Done. `src/page_delta.mojo` |
+| 2b | Read-ahead scorer, compaction trigger | `ra_depth`, `should_compact` in `fdb_vfs.c` | Done. `src/read_ahead.mojo` |
+| 2c | Commit models | `spec/GroupCommit.lean` and the rest | Not started |
 | 3 | `weft_fdb_vfs` (SQLite VFS over FoundationDB) | `fdb_vfs.c` | Not started. Needs an FDB C client and a `sqlite3_vfs` binding through Mojo's C interop |
 | 4 | Crash and handoff proofs | `prove_*.c`, `integrity.c`, `fdb_floor.c` | Not started |
 | 5 | Benchmarks | `bench_vfs.c`, `tpcc.c`, `ycsb_direct.cpp`, `game_load.cpp` | Not started |
@@ -41,6 +43,40 @@ and runs `pixi run mojo run -I src -I <clone>/src tests/keys_witness.mojo`.
 
 Both were run against two mutants of the port (little-endian `put_be32`; a `key_after`
 that keeps trailing `0xFF`). Both mutants fail the gate and the parity diff.
+
+## Slice 2a: the page delta codec
+
+`delta_encode`, `delta_apply`, `is_delta` and `delta_base_id` are `static` inside `fdb_vfs.c`, which
+needs FoundationDB and SQLite headers to compile. `tests/parity.sh` cuts the block out of that
+file with `awk` and compiles it alone (`tests/oracle_delta.c`), so the oracle is the shipping text
+and the C is not touched. If the block moves or `PAGE` changes, the script stops.
+
+- `pixi run delta-witness`: four properties and four planted-false controls (round trip with id
+  and kind, the bare header for an unchanged page, a cut delta is whole only on a run boundary,
+  a run is taken iff it fits the page and its bytes are present).
+- Parity: 400 generated pages, 1,543 lines (encoding, header fields, apply, and apply of a
+  one-byte-short delta), identical to the C.
+- Mutants: the merge gap 8 to 4 changes bytes but not meaning, so only parity catches it; the
+  witness catches a little-endian id and a quarter-page cut.
+
+## Slice 2b: the read-ahead scorer and the compaction trigger
+
+`ra_depth` and `should_compact` take an `FdbFile`, so the oracle declares a struct with just the
+four fields they read and compiles the blocks cut out of `fdb_vfs.c`.
+
+- `pixi run readahead-witness`: six properties and six planted-false controls. A scan escalates on
+  its third page and is at full depth on its fifth; a point read never escalates; a scan holds
+  through six random pages and not a seventh; a random page with no scan running costs four points
+  and stops at 0; the score stays in 0..12; the log folds when it is as large as the base and never
+  when quiet.
+- `spec/ReadAhead.lean` models the window a prefetch fills, not the scorer, so these properties
+  come from the C's comments and the numbers it cites, not from a proof.
+- Parity: 300 access sequences of 60 pages each, and a 9 x 9 grid of log and base sizes, 18,081
+  lines, identical to the C.
+- Mutants of the port, each caught by the witness: escalate 6 to 5, random decay 4 to 3, scan gap
+  8 to 9, step 2 to 3, full depth 10 to 11, and a strict compaction trigger. The generators use the
+  model's own numbers, not the port's constants; with the port's constants the gap and decay
+  mutants slipped past the witness and only parity saw them.
 
 ## Differences from the C header
 
